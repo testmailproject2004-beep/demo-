@@ -206,19 +206,37 @@ def compute_employee_slots(canvas_w: int, canvas_h: int, count: int) -> List[Dic
 
 
 def _describe_slots_as_percentages(slots: List[Dict[str, int]], canvas_w: int, canvas_h: int, names: List[str]) -> str:
+    """
+    Describe each photo zone with a generous padding buffer beyond the exact
+    paste rectangle. The model is asked to keep this whole padded area free
+    of any card/frame/shadow of its own — Python later draws the real photo
+    card (with its own border and shadow) at the precise, smaller rectangle,
+    fully covering the padded zone regardless of how loosely the model
+    interpreted the coordinates.
+    """
     lines = []
+    pad_x = 0.06 * canvas_w
+    pad_y = 0.06 * canvas_h
     for slot in slots:
         idx = slot["index"]
         name = names[idx] if idx < len(names) and names[idx].strip() else f"Employee {idx + 1}"
-        x_pct = slot["x"] / canvas_w * 100
-        y_pct = slot["y"] / canvas_h * 100
-        w_pct = slot["w"] / canvas_w * 100
-        h_pct = slot["h"] / canvas_h * 100
+
+        padded_x = max(0, slot["x"] - pad_x)
+        padded_y = max(0, slot["y"] - pad_y)
+        padded_w = slot["w"] + 2 * pad_x
+        padded_h = slot["h"] + 2 * pad_y
+
+        x_pct = padded_x / canvas_w * 100
+        y_pct = padded_y / canvas_h * 100
+        w_pct = padded_w / canvas_w * 100
+        h_pct = padded_h / canvas_h * 100
+
         lines.append(
-            f"  Placeholder {idx + 1} — \"{name}\": a soft neutral rounded rectangle card, "
-            f"positioned at {x_pct:.0f}% from the left and {y_pct:.0f}% from the top of the canvas, "
-            f"sized {w_pct:.0f}% of the canvas width by {h_pct:.0f}% of the canvas height. "
-            f"Directly beneath this card, render the name \"{name}\" and their achievement text."
+            f"  Zone {idx + 1} — \"{name}\": keep the rectangle from {x_pct:.0f}% to {(x_pct + w_pct):.0f}% "
+            f"of canvas width, and {y_pct:.0f}% to {(y_pct + h_pct):.0f}% of canvas height, as PLAIN, OPEN "
+            f"background — a simple continuation of the surrounding background texture/gradient, with NO card, "
+            f"frame, border, shadow, panel, or decorative shape drawn inside it. Just below this zone, render "
+            f"the name \"{name}\" and their achievement text."
         )
     return "\n".join(lines)
 
@@ -356,24 +374,31 @@ BACKGROUND STYLE (GENERATE FRESH):
 EMPLOYEES TO FEATURE (TEXT ONLY — DO NOT DRAW ANY PEOPLE OR FACES):
 ====================================================================={emp_section_content}
 
-PLACEHOLDER ZONES — LEAVE THESE COMPLETELY EMPTY OF ANY PERSON:
-==================================================================
-For each employee below, leave a soft, neutral, empty rounded-rectangle card
-(light gradient, subtle shadow, or simple frame — no imagery of people, faces,
-silhouettes, or portraits inside it) at the exact position and size specified.
-A real photo will be composited into this exact rectangle afterward by code,
-NOT by you. Directly beneath each card, render that employee's name and
-achievement as text.
+PLACEHOLDER ZONES — KEEP THESE COMPLETELY PLAIN, DO NOT DRAW A CARD OR FRAME:
+================================================================================
+For each employee below, a real photo (already framed with its own border and
+shadow) will be placed into this zone afterward by code — NOT by you. Do NOT
+draw a card, panel, frame, border, shadow, gradient box, or any shape to
+represent this zone. Do NOT draw any person, face, silhouette, or portrait
+there either. Simply let your background art (gradient/pattern/texture) flow
+through this rectangle exactly as it does everywhere else, as if nothing
+special were there — the photo card will fully cover it later, so anything
+you draw inside this zone will be hidden and does not need to look intentional.
+Only the name and achievement text just below the zone should be deliberately
+placed and legible.
 
 {placeholder_description}
 
-ABSOLUTE RULE — NO HUMAN FACES OR FIGURES ANYWHERE:
-======================================================
+ABSOLUTE RULE — NO HUMAN FACES OR FIGURES, AND NO CARDS IN THE ZONES:
+========================================================================
 🚨 Do NOT draw, generate, or illustrate any human face, person, figure, silhouette,
-   portrait, avatar, or character anywhere on this banner — not in the placeholder
-   zones, not in the background, not as decoration.
-🚨 The placeholder zones must be purely abstract/neutral design elements (a blank
-   card with a soft color, gradient, or subtle border) — nothing figurative.
+   portrait, avatar, or character anywhere on this banner — not in the marked zones,
+   not in the background, not as decoration.
+🚨 Do NOT draw any card, frame, panel, border, or shadow shape inside the marked
+   zones — leave that area as plain, unbroken background art. A real photo card
+   (with its own frame and shadow) will be placed there by code afterward, and it
+   will fully cover this area, so anything drawn there is wasted and may create a
+   visible mismatch — leave it empty of any deliberate shape.
 🚨 Real employee photos will be added by a separate, non-AI process after you finish.
 
 DESIGN REQUIREMENTS:
@@ -382,14 +407,14 @@ DESIGN REQUIREMENTS:
 1. LAYOUT & COMPOSITION:
    ✅ Professional corporate banner layout following the template style above
    ✅ Clear visual hierarchy with headline dominant
-   ✅ All {num_employees} placeholder card(s) positioned exactly as specified above
+   ✅ All {num_employees} zone(s) reserved (left plain) exactly as specified above
    ✅ Proper spacing, padding, and consistent margins throughout
 
 2. EMPLOYEE TEXT PRESENTATION:
-   ✅ Each employee name displayed EXACTLY ONCE, directly under their placeholder card
+   ✅ Each employee name displayed EXACTLY ONCE, directly under their zone
    ✅ Each achievement displayed EXACTLY ONCE, directly under the name
    ✅ NO duplicated text or labels
-   ✅ Text stays visually attached to its associated placeholder card
+   ✅ Text stays visually attached to its associated zone
 
 3. TEXT & TYPOGRAPHY:
    ✅ Bold, readable title at top
@@ -409,24 +434,27 @@ DESIGN REQUIREMENTS:
 6. BACKGROUND:
    ✅ Generate the background fresh, following the Background Style description above
    ✅ Professional, premium appearance that complements the theme ({theme})
-   ✅ Sufficient contrast around the placeholder cards and text for readability
+   ✅ Sufficient contrast around the reserved zones and text for readability
 
 CRITICAL REMINDERS:
 ===================
 • Use ALL PROVIDED TEXT INPUTS: title, description, theme, template style,
   background style, and every employee's name and achievement.
-• Leave ALL {num_employees} placeholder card(s) empty and positioned exactly as specified.
+• Leave ALL {num_employees} zone(s) PLAIN — no card, frame, border, or shadow shape
+  drawn inside them — positioned exactly as specified.
 • ⚠️ NO duplicate names or achievements.
 • ⚠️ NO missing employees.
 • ⚠️ NO people, faces, silhouettes, or figures drawn anywhere on the banner.
+• ⚠️ NO cards/frames/panels drawn inside the reserved zones.
 • EVERY element must be intentional and contribute to one cohesive, polished banner.
 
 OUTPUT:
 =======
 Generate a single, complete, professional sales/recognition banner background and
-layout — title, description, theme styling, empty placeholder cards at the exact
-specified positions, employee names and achievements as text, and logos — with
-absolutely no human imagery. Real photos are added afterward by code.
+layout — title, description, theme styling, plain unbroken background through the
+reserved zones at the exact specified positions, employee names and achievements
+as text, and logos — with absolutely no human imagery and no card shapes inside
+the reserved zones. Real photo cards are added afterward by code.
 
 Start generating the banner now."""
 
@@ -689,3 +717,4 @@ async def sales_banner_generate_handler(request: Request, db: AsyncSession):
             "success": False,
             "error": f"Banner generation failed: {str(exc)}"
         }, status_code=500)
+
