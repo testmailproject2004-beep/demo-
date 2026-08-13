@@ -100,7 +100,7 @@ interface SalesBannerGeneratorProps {
 /** Segmented option button — compact version of the "Target Slide Count" pills. */
 function segmentClass(active: boolean): string {
   return [
-    'rounded-md border px-2.5 py-1.5 text-center text-xs font-semibold transition-all',
+    'rounded-md border px-3 py-2 text-center text-[13px] font-medium leading-snug transition-all',
     active
       ? 'border-blue-600 bg-blue-600 text-white shadow-sm'
       : 'border-slate-300 bg-white text-slate-600 hover:border-blue-400 hover:text-blue-700',
@@ -286,12 +286,12 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3">
-      <div className="flex max-h-[94vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
+      <div className="flex max-h-[94vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl bg-white text-sm text-slate-900 antialiased shadow-2xl">
         {/* ===== Header ===== */}
         <div className="flex items-center justify-between px-5 py-3">
           <div>
-            <h1 className="text-base font-bold leading-tight text-slate-900">Banner Generator</h1>
-            <p className="text-xs text-slate-500">Powered by multi-agent LLM chain</p>
+            <div className="text-lg font-bold leading-tight text-slate-900">Banner Generator</div>
+            <div className="mt-0.5 text-xs leading-tight text-slate-500">Powered by multi-agent LLM chain</div>
           </div>
           <button
             type="button"
@@ -308,7 +308,7 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
         <div className="flex-1 space-y-4 overflow-y-auto px-5 py-3">
           {/* Banner Content */}
           <section>
-            <h2 className="mb-2 text-sm font-bold text-slate-900">Banner Content</h2>
+            <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">Banner Content</div>
             <div className="space-y-2.5">
               <div>
                 <label className="mb-1 block text-xs text-slate-600">Banner Title *</label>
@@ -333,7 +333,7 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Template */}
           <section>
-            <h2 className="mb-2 text-sm font-bold text-slate-900">Template</h2>
+            <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">Template</div>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               {bannerTemplates.map((template) => (
                 <button
@@ -351,7 +351,7 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Theme / Category */}
           <section>
-            <h2 className="mb-2 text-sm font-bold text-slate-900">Theme &amp; Category</h2>
+            <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">Theme &amp; Category</div>
             <div className="flex flex-wrap gap-1.5">
               {themeOptions.map((opt) => (
                 <button
@@ -359,7 +359,7 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
                   type="button"
                   onClick={() => setTheme(opt)}
                   className={[
-                    'rounded-full border px-2.5 py-1 text-xs font-medium transition-all',
+                    'rounded-full border px-3 py-1.5 text-[13px] font-medium leading-none transition-all',
                     theme === opt
                       ? 'border-blue-600 bg-blue-600 text-white shadow-sm'
                       : 'border-slate-300 bg-white text-slate-600 hover:border-blue-400 hover:text-blue-700',
@@ -373,7 +373,7 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Background Style */}
           <section>
-            <h2 className="mb-2 text-sm font-bold text-slate-900">Background Style</h2>
+            <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">Background Style</div>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               {backgroundStyleOptions.map((opt) => (
                 <button
@@ -394,7 +394,7 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Aspect Ratio */}
           <section>
-            <h2 className="mb-2 text-sm font-bold text-slate-900">Aspect Ratio</h2>
+            <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">Aspect Ratio</div>
             <div className="grid grid-cols-4 gap-2">
               {aspectRatioOptions.map((opt) => (
                 <button
@@ -419,10 +419,10 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Recipients */}
           <section>
-            <h2 className="mb-2 flex items-center gap-1.5 text-sm font-bold text-slate-900">
+            <div className="mb-2 flex items-center gap-1.5 text-sm font-semibold leading-tight text-slate-900">
               <Users size={15} className="text-blue-600" />
               Recipients
-            </h2>
+            </div>
 
             <div className="mb-3">
               <label className="mb-1 block text-xs text-slate-600">Number of Recipients *</label>
@@ -513,7 +513,7 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
           {previewUrl && (
             <section>
               <div className="mb-2 flex items-center justify-between">
-                <h2 className="text-sm font-bold text-slate-900">Preview</h2>
+                <div className="text-sm font-semibold leading-tight text-slate-900">Preview</div>
                 <button
                   type="button"
                   onClick={downloadBanner}
