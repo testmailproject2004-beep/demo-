@@ -1,1 +1,628 @@
-https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http://localhost:58232/callback&scope=org:create_api_key+user:profile+user:inference+user:sessions:claude_code+user:mcp_servers+user:file_upload&code_challenge=o-CBe8MVM__jQKc4kH9q2zz8t4j--F25RREiemgH7s8&code_challenge_method=S256&state=uukMR17Tt0-bceYd5zTe20d0ZwUocvStt0uJkxLCx-0
+import { useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  AlertCircle,
+  ChevronDown,
+  Download,
+  ImagePlus,
+  Loader,
+  Sparkles,
+  Users,
+  X,
+} from 'lucide-react';
+import { middleware_url } from '../../utils/constants';
+
+const bannerTemplates = [
+  {
+    id: 'corporate-achievement',
+    name: 'Corporate Achievement',
+    accent: '#2563eb',
+    summary: 'Celebrating milestones and corporate success.',
+    emoji: '🏆',
+  },
+  {
+    id: 'employee-recognition',
+    name: 'Employee Recognition',
+    accent: '#1e40af',
+    summary: 'Celebrating contribution, impact, and teamwork.',
+    emoji: '👏',
+  },
+  {
+    id: 'sales-champion',
+    name: 'Sales Champion',
+    accent: '#dc2626',
+    summary: 'Recognizing top sales performers and revenue wins.',
+    emoji: '⭐',
+  },
+  {
+    id: 'leadership-award',
+    name: 'Leadership Award',
+    accent: '#7c3aed',
+    summary: 'Honoring excellence in leadership and vision.',
+    emoji: '👑',
+  },
+  {
+    id: 'milestone-celebration',
+    name: 'Milestone Celebration',
+    accent: '#16a34a',
+    summary: 'Celebrating achievements and company milestones.',
+    emoji: '🎉',
+  },
+  {
+    id: 'star-performer',
+    name: 'Star Performer',
+    accent: '#f59e0b',
+    summary: 'Recognizing exceptional performance and results.',
+    emoji: '✨',
+  },
+] as const;
+
+const themeOptions = [
+  'Sales Excellence',
+  'Leadership & Vision',
+  'Team Achievement',
+  'Customer Success',
+  'Innovation Award',
+  'Milestone Celebration',
+  'Annual Excellence',
+  'Employee of the Month',
+  'Award Recognition',
+] as const;
+
+const backgroundStyleOptions = [
+  { id: 'corporate-blue-gradient', label: 'Corporate Blue Gradient' },
+  { id: 'premium-gold-navy', label: 'Premium Gold & Navy' },
+  { id: 'vibrant-celebration', label: 'Vibrant Celebration' },
+  { id: 'minimal-professional-white', label: 'Minimal Professional White' },
+  { id: 'dark-premium-elegance', label: 'Dark Premium Elegance' },
+  { id: 'fresh-green-energy', label: 'Fresh Green Energy' },
+] as const;
+
+const aspectRatioOptions = [
+  { value: '16:9', label: '16:9 (Widescreen)' },
+  { value: '1:1', label: '1:1 (Square)' },
+  { value: '4:5', label: '4:5 (Portrait)' },
+  { value: '9:16', label: '9:16 (Vertical)' },
+] as const;
+
+const recipientCountOptions = [1, 2, 3, 4] as const;
+
+interface EmployeeData {
+  name: string;
+  photo: string | null;
+  achievement?: string;
+}
+
+interface SalesBannerGeneratorProps {
+  /** Called when the modal is dismissed (X, Cancel). Either prop works. */
+  onClose?: () => void;
+  onBack?: () => void;
+  /**
+   * Set to false if you render this inside an existing modal/dialog wrapper,
+   * so it doesn't add a second full-screen overlay of its own.
+   */
+  overlay?: boolean;
+}
+
+const labelClass = 'mb-1 block text-[11px] font-semibold uppercase tracking-wider text-slate-500';
+
+const inputClass =
+  'w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-900 transition focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600';
+
+function SelectField({
+  label,
+  value,
+  onChange,
+  hint,
+  children,
+}: {
+  label: string;
+  value: string | number;
+  onChange: (value: string) => void;
+  hint?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      <label className={labelClass}>{label}</label>
+      <div className="relative">
+        <select
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full cursor-pointer appearance-none rounded-md border border-slate-300 bg-white px-2.5 py-1.5 pr-8 text-sm text-slate-900 transition focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
+        >
+          {children}
+        </select>
+        <ChevronDown
+          size={14}
+          className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400"
+        />
+      </div>
+      {hint && <p className="mt-1 text-[11px] leading-snug text-slate-500">{hint}</p>}
+    </div>
+  );
+}
+
+export function SalesBannerGenerator({ onClose, onBack, overlay = true }: SalesBannerGeneratorProps) {
+  const handleClose = onClose ?? onBack ?? (() => {});
+
+  // Core banner fields
+  const [selectedTemplate, setSelectedTemplate] =
+    useState<(typeof bannerTemplates)[number]['id']>('employee-recognition');
+  const [bannerTitle, setBannerTitle] = useState('Awards Ceremony');
+  const [description, setDescription] = useState('');
+  const [theme, setTheme] = useState<(typeof themeOptions)[number]>('Award Recognition');
+  const [backgroundStyle, setBackgroundStyle] =
+    useState<(typeof backgroundStyleOptions)[number]['id']>('corporate-blue-gradient');
+
+  // Employee data (1-4 employees)
+  const [numberOfEmployees, setNumberOfEmployees] = useState<1 | 2 | 3 | 4>(1);
+  const [employees, setEmployees] = useState<EmployeeData[]>([
+    { name: '', photo: null, achievement: '' },
+    { name: '', photo: null, achievement: '' },
+    { name: '', photo: null, achievement: '' },
+    { name: '', photo: null, achievement: '' },
+  ]);
+
+  // UI state
+  const [aspectRatio, setAspectRatio] = useState('16:9');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [history, setHistory] = useState<Array<{ title: string; time: string; image: string }>>([]);
+
+  const employeePhotoInputRefs = useRef<(HTMLInputElement | null)[]>([]);
+
+  const activeTemplate = useMemo(
+    () => bannerTemplates.find((template) => template.id === selectedTemplate) ?? bannerTemplates[0],
+    [selectedTemplate],
+  );
+
+  const handleEmployeePhotoUpload = (index: number, file: File | null) => {
+    if (!file) return;
+
+    if (!['image/png', 'image/jpeg', 'image/jpg'].includes(file.type)) {
+      setError('Only PNG, JPG, and JPEG files are supported');
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      setError('Image size must be less than 10MB');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      const newEmployees = [...employees];
+      newEmployees[index].photo = result;
+      setEmployees(newEmployees);
+      setError(null);
+    };
+    reader.onerror = () => {
+      setError('Failed to read image file');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleEmployeeNameChange = (index: number, name: string) => {
+    const newEmployees = [...employees];
+    newEmployees[index].name = name;
+    setEmployees(newEmployees);
+  };
+
+  const handleEmployeeAchievementChange = (index: number, achievement: string) => {
+    const newEmployees = [...employees];
+    newEmployees[index].achievement = achievement;
+    setEmployees(newEmployees);
+  };
+
+  const clearEmployeePhoto = (index: number) => {
+    const newEmployees = [...employees];
+    newEmployees[index].photo = null;
+    setEmployees(newEmployees);
+  };
+
+  const generateBanner = async () => {
+    if (!bannerTitle.trim()) {
+      setError('Banner title is required');
+      return;
+    }
+
+    if (!description.trim()) {
+      setError('Description is required');
+      return;
+    }
+
+    for (let i = 0; i < numberOfEmployees; i++) {
+      if (!employees[i].name.trim()) {
+        setError(`Recipient ${i + 1} name is required`);
+        return;
+      }
+      if (!employees[i].photo) {
+        setError(`Recipient ${i + 1} photo is required`);
+        return;
+      }
+    }
+
+    setLoading(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const token = localStorage.getItem('token');
+
+      const payload = {
+        title: bannerTitle.trim(),
+        description: description.trim(),
+        theme,
+        template_id: selectedTemplate,
+        background_style: backgroundStyle,
+        aspect_ratio: aspectRatio,
+        number_of_employees: numberOfEmployees,
+        employees: employees.slice(0, numberOfEmployees).map((emp) => ({
+          name: emp.name.trim(),
+          photo: emp.photo,
+          achievement: (emp.achievement || '').trim(),
+        })),
+        accent_color: activeTemplate.accent,
+      };
+
+      const response = await fetch(`${middleware_url}/batch_process/sales_platform/banner/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await response.json();
+      const isSuccess = data.success ?? data.status === 'success';
+
+      if (!response.ok || !isSuccess) {
+        throw new Error(data.error || data.message || 'Banner generation failed');
+      }
+
+      const imageData = data.image_base64 || data.banner?.image_base64 || data.preview_url;
+      if (!imageData) {
+        throw new Error('No banner image returned by the server');
+      }
+
+      const bannerImage = imageData.startsWith('data:image')
+        ? imageData
+        : `data:image/png;base64,${imageData}`;
+      setPreviewUrl(bannerImage);
+      setSuccess('Banner generated successfully!');
+
+      setHistory((prev) =>
+        [
+          {
+            title: bannerTitle.trim(),
+            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            image: bannerImage,
+          },
+          ...prev,
+        ].slice(0, 6),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to generate banner');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const downloadBanner = () => {
+    if (!previewUrl) return;
+    const link = document.createElement('a');
+    link.href = previewUrl;
+    link.download = `award-banner-${new Date().getTime()}.png`;
+    link.click();
+  };
+
+  const card = (
+    <div className="flex max-h-[94vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl bg-white text-sm text-slate-900 antialiased shadow-2xl">
+      {/* ===== Header ===== */}
+      <div className="flex items-center justify-between px-5 py-3">
+        <div>
+          <div className="text-lg font-bold leading-tight text-slate-900">Banner Generator</div>
+          <div className="mt-0.5 text-xs leading-tight text-slate-500">
+            Powered by multi-agent LLM chain
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={handleClose}
+          aria-label="Close"
+          className="rounded-md p-1 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+        >
+          <X size={18} />
+        </button>
+      </div>
+      <div className="border-b border-blue-100" />
+
+      {/* ===== Scrollable body ===== */}
+      <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
+        {/* Banner Content */}
+        <section>
+          <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">
+            Banner Content
+          </div>
+          <div className="space-y-3">
+            <div>
+              <label className={labelClass}>Banner Title *</label>
+              <input
+                value={bannerTitle}
+                onChange={(e) => setBannerTitle(e.target.value)}
+                placeholder="e.g., Annual Awards Ceremony"
+                className={inputClass}
+              />
+            </div>
+            <div>
+              <label className={labelClass}>Description *</label>
+              <textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="e.g., Recognizing excellence and outstanding performance"
+                className={`${inputClass} min-h-[48px] resize-none`}
+              />
+            </div>
+          </div>
+        </section>
+<br/>
+        {/* Banner Settings */}
+        <section>
+          <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">
+            Banner Settings
+          </div>
+          <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
+            <SelectField
+              label="Template"
+              value={selectedTemplate}
+              onChange={(v) => setSelectedTemplate(v as (typeof bannerTemplates)[number]['id'])}
+              hint={activeTemplate.summary}
+            >
+              {bannerTemplates.map((template) => (
+                <option key={template.id} value={template.id}>
+                  {template.emoji} {template.name}
+                </option>
+              ))}
+            </SelectField>
+
+            <SelectField
+              label="Theme / Category"
+              value={theme}
+              onChange={(v) => setTheme(v as (typeof themeOptions)[number])}
+            >
+              {themeOptions.map((opt) => (
+                <option key={opt} value={opt}>
+                  {opt}
+                </option>
+              ))}
+            </SelectField>
+
+            <SelectField
+              label="Background Style"
+              value={backgroundStyle}
+              onChange={(v) =>
+                setBackgroundStyle(v as (typeof backgroundStyleOptions)[number]['id'])
+              }
+              hint="Generated fresh — recipient photos are pasted in as-is and never redrawn."
+            >
+              {backgroundStyleOptions.map((opt) => (
+                <option key={opt.id} value={opt.id}>
+                  {opt.label}
+                </option>
+              ))}
+            </SelectField>
+
+            <SelectField
+              label="Aspect Ratio"
+              value={aspectRatio}
+              onChange={(v) => setAspectRatio(v)}
+            >
+              {aspectRatioOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </SelectField>
+          </div>
+        </section>
+<br/>
+        {/* Recipients */}
+        <section>
+          <div className="mb-2 flex items-center gap-1.5 text-sm font-semibold leading-tight text-slate-900">
+            <Users size={15} className="text-blue-600" />
+            Recipients
+          </div>
+
+          <div className="mb-3 sm:w-1/2 sm:pr-2">
+            <SelectField
+              label="Number of Recipients"
+              value={numberOfEmployees}
+              onChange={(v) => setNumberOfEmployees(parseInt(v, 10) as 1 | 2 | 3 | 4)}
+            >
+              {recipientCountOptions.map((n) => (
+                <option key={n} value={n}>
+                  {n} Recipient{n > 1 ? 's' : ''}
+                </option>
+              ))}
+            </SelectField>
+          </div>
+
+          <div className="space-y-2.5">
+            {Array.from({ length: numberOfEmployees }).map((_, index) => (
+              <div key={index} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <p className="mb-2 text-xs font-semibold text-slate-900">Recipient {index + 1}</p>
+
+                <div className="mb-2 grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2">
+                  <div>
+                    <label className={labelClass}>Name *</label>
+                    <input
+                      value={employees[index].name}
+                      onChange={(e) => handleEmployeeNameChange(index, e.target.value)}
+                      placeholder="Enter recipient name"
+                      className={inputClass}
+                    />
+                  </div>
+                  <div>
+                    <label className={labelClass}>
+                      Achievement <span className="normal-case text-slate-400">(optional)</span>
+                    </label>
+                    <input
+                      value={employees[index].achievement || ''}
+                      onChange={(e) => handleEmployeeAchievementChange(index, e.target.value)}
+                      placeholder="e.g., Top Sales Performer"
+                      className={inputClass}
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className={labelClass}>Photo *</label>
+                  {employees[index].photo ? (
+                    <div className="flex items-center gap-2.5">
+                      <img
+                        src={employees[index].photo as string}
+                        alt={`Recipient ${index + 1}`}
+                        className="h-11 w-11 rounded-md border border-slate-200 object-cover"
+                      />
+                      <span className="text-xs text-slate-500">Photo uploaded</span>
+                      <button
+                        type="button"
+                        onClick={() => clearEmployeePhoto(index)}
+                        className="ml-auto rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 transition hover:border-red-400 hover:text-red-600"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ) : (
+                    <label className="flex cursor-pointer items-center gap-2.5">
+                      <span className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:border-blue-500 hover:text-blue-700">
+                        <ImagePlus size={13} />
+                        Choose File
+                      </span>
+                      <span className="text-xs text-slate-400">No file chosen</span>
+                      <input
+                        ref={(ref) => {
+                          if (ref) employeePhotoInputRefs.current[index] = ref;
+                        }}
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) =>
+                          handleEmployeePhotoUpload(index, e.target.files?.[0] || null)
+                        }
+                        className="sr-only"
+                      />
+                    </label>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* Preview */}
+        {previewUrl && (
+          <section>
+            <div className="mb-2 flex items-center justify-between">
+              <div className="text-sm font-semibold leading-tight text-slate-900">Preview</div>
+              <button
+                type="button"
+                onClick={downloadBanner}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+              >
+                <Download size={13} />
+                Download PNG
+              </button>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
+              <img
+                src={previewUrl}
+                alt="Generated banner"
+                className="mx-auto max-h-[280px] w-full rounded-md object-contain shadow-sm"
+              />
+            </div>
+
+            {history.length > 0 && (
+              <div className="mt-3">
+                <p className="mb-1.5 text-xs text-slate-600">Recent banners</p>
+                <div className="grid grid-cols-3 gap-2">
+                  {history.map((item, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => setPreviewUrl(item.image)}
+                      className="group relative overflow-hidden rounded-md border border-slate-200 transition hover:border-blue-500"
+                    >
+                      <img src={item.image} alt={item.title} className="h-14 w-full object-cover" />
+                      <div className="absolute inset-0 flex items-end bg-black/0 p-1.5 transition group-hover:bg-black/30">
+                        <span className="truncate text-[10px] font-semibold text-white opacity-0 transition group-hover:opacity-100">
+                          {item.title}
+                        </span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Messages */}
+        {error && (
+          <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50 p-2.5">
+            <AlertCircle size={15} className="mt-0.5 flex-shrink-0 text-red-600" />
+            <p className="text-xs font-medium text-red-900">{error}</p>
+          </div>
+        )}
+        {success && (
+          <div className="flex items-start gap-2 rounded-md border border-green-200 bg-green-50 p-2.5">
+            <Sparkles size={15} className="mt-0.5 flex-shrink-0 text-green-600" />
+            <p className="text-xs font-medium text-green-900">{success}</p>
+          </div>
+        )}
+      </div>
+
+      {/* ===== Footer ===== */}
+      <div className="flex items-center justify-between border-t border-slate-200 px-5 py-2.5">
+        <button
+          type="button"
+          onClick={handleClose}
+          className="rounded-md px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={generateBanner}
+          disabled={loading}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-indigo-500 to-blue-600 px-4 py-2 text-sm font-semibold text-white shadow transition hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {loading ? (
+            <>
+              <Loader size={14} className="animate-spin" />
+              Generating...
+            </>
+          ) : (
+            <>
+              <Sparkles size={14} />
+              Generate Banner
+            </>
+          )}
+        </button>
+      </div>
+    </div>
+  );
+
+  if (!overlay) {
+    return card;
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3">
+      {card}
+    </div>
+  );
+}   
