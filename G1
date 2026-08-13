@@ -1,1 +1,1183 @@
+"""
+sales_banner.py
+===============
+
+Award / recognition banner generator for the Sales platform.
+
+WHY THIS IS BUILT THE WAY IT IS
+-------------------------------
+Generative image models *always* redraw faces. There is no prompt that reliably
+stops it. So we never send the employee photos to the image model at all.
+
+Pipeline ("plate + composite"):
+
+    1. Text LLM  -> writes an image prompt for a BACKGROUND PLATE ONLY.
+                    No people, no faces, no text, no logos. Just an empty,
+                    designed stage with reserved clean zones.
+    2. Gemini    -> renders that plate at the requested aspect ratio.
+                    (If it fails, we fall back to a procedural gradient plate,
+                    so the endpoint never hard-fails.)
+    3. Pillow    -> deterministically composites, in this order:
+                       title -> description -> recipient cards
+                       (photo + name + achievement) -> logo
+                    Photos are pasted pixel-exact, then *harmonised* (tint,
+                    luminance and grain matched to the local background) so
+                    they sit in the design instead of looking stuck on.
+    4. Logo      -> the flat-black Zensar mark is recoloured to white or black
+                    by measuring the luminance actually under it.
+
+Everything the user must be able to read (title, names, achievements) is
+rendered as real vector text, so it is never garbled and never misspelled.
+
+INTEGRATION NOTES
+-----------------
+* The React modal (SalesBannerGenerator.tsx) expects JSON, not a PNG stream:
+      { "success": true, "image_base64": "<...>" }
+  handle_sales_banner() returns exactly that. The sample banner.py returns a
+  raw Response(media_type="image/png") -- that shape will NOT work with the
+  existing frontend.
+* Relative imports below mirror sample banner.py. Adjust the dots if this file
+  lives at a different depth.
+* Drop brand fonts (Montserrat / Poppins / Inter TTFs) into FONT_DIR and they
+  are picked up automatically. Otherwise DejaVu is used.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import logging
+import os
+import re
+import textwrap
+import uuid as uuid_lib
+from typing import Any, Sequence
+
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+# --- project imports (mirror sample banner.py; adjust depth if needed) -------
+from common.llm_utils.litellm_aexecute import image_llm_aexecute
+from common.database.models.content_factory import HLSTransaction
+from ..hls_platform.connectors.connector_factory import HLSDomainType
+from ..hls_platform.utils import initialize_5o_mini_llm
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+ASSETS_DIR = os.environ.get(
+    "SALES_BANNER_ASSETS",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets"),
+)
+FONT_DIR = os.path.join(ASSETS_DIR, "fonts")
+LOGO_PATH = os.environ.get("ZENSAR_LOGO_PATH", os.path.join(ASSETS_DIR, "zensar_logo.png"))
+
+# Canvas sizes per aspect ratio.
+CANVAS_SIZES: dict[str, tuple[int, int]] = {
+    "16:9": (1920, 1080),
+    "1:1": (1440, 1440),
+    "4:5": (1240, 1550),
+    "9:16": (1080, 1920),
+    "4:3": (1600, 1200),
+    "3:2": (1800, 1200),
+}
+
+TEMPLATE_PRESETS: dict[str, dict[str, Any]] = {
+    "corporate-achievement": {"accent": "#2563eb", "mood": "polished corporate, confident"},
+    "employee-recognition": {"accent": "#1e40af", "mood": "warm, human, appreciative"},
+    "sales-champion": {"accent": "#dc2626", "mood": "high energy, competitive, bold"},
+    "leadership-award": {"accent": "#7c3aed", "mood": "prestigious, refined, authoritative"},
+    "milestone-celebration": {"accent": "#16a34a", "mood": "celebratory, optimistic, festive"},
+    "star-performer": {"accent": "#f59e0b", "mood": "spotlight, premium, radiant"},
+}
+
+BACKGROUND_STYLES: dict[str, str] = {
+    "corporate-blue-gradient": (
+        "deep corporate blue to indigo gradient, soft directional light sweep, "
+        "faint geometric line-work, subtle bokeh depth"
+    ),
+    "premium-gold-navy": (
+        "rich midnight navy base with brushed gold accents, thin metallic pinstripes, "
+        "luxurious low-key lighting, soft gold particle glow"
+    ),
+    "vibrant-celebration": (
+        "vivid multi-colour gradient with soft confetti bokeh and light streaks, "
+        "energetic but not cluttered"
+    ),
+    "minimal-professional-white": (
+        "clean off-white and pale grey studio backdrop, very soft shadow gradients, "
+        "one thin accent stripe, generous negative space"
+    ),
+    "dark-premium-elegance": (
+        "near-black charcoal base with subtle graphite texture, soft rim light from top-left, "
+        "faint diagonal glass reflections"
+    ),
+    "fresh-green-energy": (
+        "fresh emerald to teal gradient, soft organic curves, airy light, subtle leaf-like bokeh"
+    ),
+}
+
+# Styles whose plate is light -> text must be dark.
+LIGHT_STYLES = {"minimal-professional-white"}
+
+MAX_RECIPIENTS = 4
+
+
+# =============================================================================
+# SMALL UTILITIES
+# =============================================================================
+
+def _hex_to_rgb(value: str, default: tuple[int, int, int] = (37, 99, 235)) -> tuple[int, int, int]:
+    if not value:
+        return default
+    v = value.strip().lstrip("#")
+    if len(v) == 3:
+        v = "".join(c * 2 for c in v)
+    if len(v) != 6:
+        return default
+    try:
+        return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+    except ValueError:
+        return default
+
+
+def _mix(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[int, int, int]:
+    return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))  # type: ignore[return-value]
+
+
+def _luminance(rgb: Sequence[float]) -> float:
+    return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+
+
+def _region_luminance(img: Image.Image, box: tuple[int, int, int, int]) -> float:
+    x0, y0, x1, y1 = box
+    x0 = max(0, min(img.width - 1, int(x0)))
+    y0 = max(0, min(img.height - 1, int(y0)))
+    x1 = max(x0 + 1, min(img.width, int(x1)))
+    y1 = max(y0 + 1, min(img.height, int(y1)))
+    patch = img.convert("RGB").crop((x0, y0, x1, y1))
+    return _luminance(ImageStat.Stat(patch).mean)
+
+
+def _region_mean_rgb(img: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, int, int]:
+    x0, y0, x1, y1 = box
+    x0 = max(0, min(img.width - 1, int(x0)))
+    y0 = max(0, min(img.height - 1, int(y0)))
+    x1 = max(x0 + 1, min(img.width, int(x1)))
+    y1 = max(y0 + 1, min(img.height, int(y1)))
+    patch = img.convert("RGB").crop((x0, y0, x1, y1))
+    m = ImageStat.Stat(patch).mean
+    return (int(m[0]), int(m[1]), int(m[2]))
+
+
+def _decode_data_url(value: str | None) -> bytes | None:
+    """Accept a data: URL, a bare base64 string, or None."""
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if raw.startswith("data:"):
+        parts = raw.split(",", 1)
+        if len(parts) != 2:
+            return None
+        raw = parts[1]
+    raw = re.sub(r"\s+", "", raw)
+    try:
+        return base64.b64decode(raw, validate=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not decode image payload: %s", exc)
+        return None
+
+
+def _open_rgb(data: bytes) -> Image.Image:
+    img = Image.open(io.BytesIO(data))
+    img.load()
+    if img.mode in ("RGBA", "LA", "P"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        rgba = img.convert("RGBA")
+        bg.paste(rgba, mask=rgba.split()[3])
+        return bg
+    return img.convert("RGB")
+
+
+def _slugify(text: str, fallback: str = "banner") -> str:
+    s = re.sub(r"[^\w\s-]", "", (text or "")).strip()
+    s = re.sub(r"[-\s]+", "_", s)
+    return s or fallback
+
+
+# =============================================================================
+# FONTS
+# =============================================================================
+
+_FONT_CANDIDATES = {
+    "black": [
+        "Montserrat-ExtraBold.ttf", "Poppins-ExtraBold.ttf", "Inter-ExtraBold.ttf",
+        "Montserrat-Bold.ttf", "Poppins-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ],
+    "bold": [
+        "Montserrat-Bold.ttf", "Poppins-Bold.ttf", "Inter-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ],
+    "medium": [
+        "Montserrat-Medium.ttf", "Poppins-Medium.ttf", "Inter-Medium.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ],
+    "regular": [
+        "Montserrat-Regular.ttf", "Poppins-Regular.ttf", "Inter-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ],
+}
+
+_font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+
+
+def _font(weight: str, size: int) -> ImageFont.FreeTypeFont:
+    size = max(8, int(size))
+    key = (weight, size)
+    if key in _font_cache:
+        return _font_cache[key]
+
+    for candidate in _FONT_CANDIDATES.get(weight, _FONT_CANDIDATES["regular"]):
+        path = candidate if os.path.isabs(candidate) else os.path.join(FONT_DIR, candidate)
+        if os.path.exists(path):
+            try:
+                f = ImageFont.truetype(path, size)
+                _font_cache[key] = f
+                return f
+            except Exception:  # noqa: BLE001
+                continue
+
+    f = ImageFont.load_default()
+    _font_cache[key] = f  # type: ignore[assignment]
+    return f  # type: ignore[return-value]
+
+
+def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
+    box = draw.textbbox((0, 0), text, font=font)
+    return box[2] - box[0], box[3] - box[1]
+
+
+def _fit_font(draw: ImageDraw.ImageDraw, text: str, weight: str,
+              max_width: int, start: int, minimum: int = 12) -> ImageFont.FreeTypeFont:
+    """Shrink until the string fits max_width. Never lets text overflow the canvas."""
+    size = start
+    while size > minimum:
+        f = _font(weight, size)
+        if _text_size(draw, text, f)[0] <= max_width:
+            return f
+        size = int(size * 0.94) - 1
+    return _font(weight, minimum)
+
+
+def _wrap(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
+    words = (text or "").split()
+    if not words:
+        return []
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        trial = f"{current} {word}"
+        if _text_size(draw, trial, font)[0] <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+# =============================================================================
+# MASKS / SHADOWS / GLASS
+# =============================================================================
+
+def _alpha_paste(canvas: Image.Image, layer: Image.Image, xy: tuple[int, int]) -> None:
+    """alpha_composite that tolerates negative / overflowing coordinates."""
+    x, y = int(xy[0]), int(xy[1])
+    cx0, cy0 = max(0, x), max(0, y)
+    cx1, cy1 = min(canvas.width, x + layer.width), min(canvas.height, y + layer.height)
+    if cx1 <= cx0 or cy1 <= cy0:
+        return
+    crop = layer.crop((cx0 - x, cy0 - y, cx1 - x, cy1 - y))
+    canvas.alpha_composite(crop, (cx0, cy0))
+
+
+def _circle_mask(size: int, supersample: int = 4, feather: float = 1.2) -> Image.Image:
+    big = size * supersample
+    mask = Image.new("L", (big, big), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, big - 1, big - 1), fill=255)
+    mask = mask.resize((size, size), Image.LANCZOS)
+    return mask.filter(ImageFilter.GaussianBlur(feather))
+
+
+def _rounded_mask(size: tuple[int, int], radius: int,
+                  supersample: int = 4, feather: float = 1.0) -> Image.Image:
+    w, h = size
+    big = (w * supersample, h * supersample)
+    mask = Image.new("L", big, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, big[0] - 1, big[1] - 1), radius=radius * supersample, fill=255
+    )
+    mask = mask.resize((w, h), Image.LANCZOS)
+    return mask.filter(ImageFilter.GaussianBlur(feather))
+
+
+def _paste_shadow(canvas: Image.Image, mask: Image.Image, xy: tuple[int, int],
+                  blur: int = 24, offset: tuple[int, int] = (0, 14),
+                  opacity: int = 120, spread: int = 8) -> None:
+    """Soft drop shadow derived from an alpha mask. Grounds the element in the scene."""
+    w, h = mask.size
+    pad = blur * 2 + spread
+    shadow_mask = Image.new("L", (w + pad * 2, h + pad * 2), 0)
+    grown = mask.resize((w + spread * 2, h + spread * 2), Image.LANCZOS)
+    shadow_mask.paste(grown, (pad - spread, pad - spread))
+    shadow_mask = shadow_mask.filter(ImageFilter.GaussianBlur(blur))
+    shadow_mask = shadow_mask.point(lambda p: int(p * opacity / 255))
+
+    shadow = Image.new("RGBA", shadow_mask.size, (0, 0, 0, 0))
+    shadow.putalpha(shadow_mask)
+    _alpha_paste(canvas, shadow, (xy[0] - pad + offset[0], xy[1] - pad + offset[1]))
+
+
+def _frosted_panel(canvas: Image.Image, box: tuple[int, int, int, int], radius: int,
+                   tint: tuple[int, int, int], tint_alpha: int = 46,
+                   blur: int = 22, border: tuple[int, int, int, int] | None = None) -> None:
+    """
+    Frosted-glass card: blur what is already behind the box, tint it, paste back
+    through a rounded mask. This is what makes composited elements read as part
+    of the generated background rather than pasted on top of it.
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(canvas.width, x1), min(canvas.height, y1)
+    if x1 <= x0 or y1 <= y0:
+        return
+
+    region = canvas.crop((x0, y0, x1, y1)).convert("RGB")
+    region = region.filter(ImageFilter.GaussianBlur(blur))
+    overlay = Image.new("RGB", region.size, tint)
+    region = Image.blend(region, overlay, tint_alpha / 255.0)
+
+    panel = region.convert("RGBA")
+    if border:
+        ImageDraw.Draw(panel).rounded_rectangle(
+            (0, 0, panel.width - 1, panel.height - 1), radius=radius, outline=border, width=2
+        )
+    panel.putalpha(_rounded_mask(panel.size, radius))
+    canvas.alpha_composite(panel, (x0, y0))
+
+
+def _scrim(canvas: Image.Image, box: tuple[int, int, int, int],
+           dark: bool, strength: float = 0.42, blur: int = 60) -> None:
+    """
+    Guaranteed text legibility. We never trust the image model to actually leave
+    the reserved zone clean, so we darken/lighten it ourselves with a soft,
+    feathered gradient before drawing text on it.
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    w, h = max(1, x1 - x0), max(1, y1 - y0)
+    colour = (0, 0, 0) if dark else (255, 255, 255)
+
+    # Pad the layer by 2x the blur radius. Without this the rounded rectangle
+    # touches the layer edge, the blur has nothing to fade into, and you get a
+    # visible hard-edged box sitting on the background.
+    pad = blur * 2
+    layer = Image.new("L", (w + pad * 2, h + pad * 2), 0)
+    ImageDraw.Draw(layer).rounded_rectangle(
+        (pad, pad, pad + w - 1, pad + h - 1),
+        radius=int(min(w, h) * 0.35), fill=int(255 * strength),
+    )
+    layer = layer.filter(ImageFilter.GaussianBlur(blur))
+
+    scrim = Image.new("RGBA", layer.size, colour + (0,))
+    scrim.putalpha(layer)
+    _alpha_paste(canvas, scrim, (x0 - pad, y0 - pad))
+
+
+def _draw_text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font,
+               fill: tuple[int, int, int], anchor: str = "mm",
+               shadow: tuple[int, int, int, int] | None = (0, 0, 0, 110),
+               shadow_offset: tuple[int, int] = (0, 3)) -> None:
+    if shadow:
+        draw.text((xy[0] + shadow_offset[0], xy[1] + shadow_offset[1]),
+                  text, font=font, fill=shadow, anchor=anchor)
+    draw.text(xy, text, font=font, fill=fill, anchor=anchor)
+
+
+# =============================================================================
+# PHOTO HANDLING  (the part that matters most)
+# =============================================================================
+
+def _smart_crop(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """
+    Cover-crop biased toward the upper third so heads do not get cut off.
+    Uses OpenCV face detection when available, otherwise the rule-of-thirds bias.
+    """
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w, new_h = max(target_w, int(src_w * scale)), max(target_h, int(src_h * scale))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+
+    focus_x, focus_y = new_w / 2, new_h * 0.40  # default: upper-middle
+
+    try:  # optional, silently skipped if cv2 is not installed
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+
+        gray = cv2.cvtColor(np.array(resized), cv2.COLOR_RGB2GRAY)
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5)
+        if len(faces):
+            xs = [x + w / 2 for (x, y, w, h) in faces]
+            ys = [y + h / 2 for (x, y, w, h) in faces]
+            focus_x = sum(xs) / len(xs)
+            focus_y = sum(ys) / len(ys) + min(h for (_, _, _, h) in faces) * 0.15
+    except Exception:  # noqa: BLE001
+        pass
+
+    left = int(max(0, min(new_w - target_w, focus_x - target_w / 2)))
+    top = int(max(0, min(new_h - target_h, focus_y - target_h / 2)))
+    return resized.crop((left, top, left + target_w, top + target_h))
+
+
+def _harmonise(photo: Image.Image, ambient: tuple[int, int, int],
+               strength: float = 0.16) -> Image.Image:
+    """
+    Make a real photograph sit inside a generated scene.
+
+    Real photos fail to blend because their white balance, exposure and grain
+    come from a different world than the plate. We pull each of those partway
+    toward the local background: a light ambient tint, a partial luminance
+    match, a touch of contrast, slightly reduced saturation, and a gentle
+    sharpen so downscaled headshots stay crisp.
+    """
+    photo = photo.convert("RGB")
+
+    tint = Image.new("RGB", photo.size, ambient)
+    out = Image.blend(photo, tint, strength)
+
+    photo_lum = ImageStat.Stat(photo.convert("L")).mean[0] or 1.0
+    ambient_lum = _luminance(ambient)
+    target_lum = photo_lum + (ambient_lum - photo_lum) * 0.22
+    factor = max(0.78, min(1.28, target_lum / photo_lum))
+    out = ImageEnhance.Brightness(out).enhance(factor)
+
+    out = ImageEnhance.Contrast(out).enhance(1.07)
+    out = ImageEnhance.Color(out).enhance(0.93)
+    out = out.filter(ImageFilter.UnsharpMask(radius=2, percent=65, threshold=3))
+    return out
+
+
+def _rim_light(size: int, colour: tuple[int, int, int], strength: int = 70) -> Image.Image:
+    """Accent-coloured rim on the photo edge — sells the 'lit by the scene' look."""
+    outer = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(outer).ellipse((0, 0, size - 1, size - 1), fill=strength)
+    inner = Image.new("L", (size, size), 0)
+    inset = max(2, int(size * 0.045))
+    ImageDraw.Draw(inner).ellipse((inset, inset, size - 1 - inset, size - 1 - inset), fill=strength)
+    ring = ImageChops.subtract(outer, inner).filter(ImageFilter.GaussianBlur(size * 0.02))
+
+    layer = Image.new("RGBA", (size, size), colour + (0,))
+    layer.putalpha(ring)
+    return layer
+
+
+def _render_photo_disc(photo: Image.Image, diameter: int, ambient: tuple[int, int, int],
+                       accent: tuple[int, int, int], ring_colour: tuple[int, int, int]) -> tuple[Image.Image, Image.Image]:
+    """Return (RGBA disc ready to composite, alpha mask for the shadow)."""
+    ss = 2  # render at 2x then downsample for clean edges
+    d = diameter * ss
+
+    cropped = _smart_crop(photo, d, d)
+    cropped = _harmonise(cropped, ambient)
+
+    disc = cropped.convert("RGBA")
+    mask = _circle_mask(d, supersample=2, feather=d * 0.004)
+    disc.putalpha(mask)
+
+    # accent ring drawn just outside the photo edge
+    ring_w = max(3, int(d * 0.022))
+    ring_layer = Image.new("RGBA", (d, d), (0, 0, 0, 0))
+    ImageDraw.Draw(ring_layer).ellipse(
+        (ring_w // 2, ring_w // 2, d - 1 - ring_w // 2, d - 1 - ring_w // 2),
+        outline=ring_colour + (235,), width=ring_w,
+    )
+    disc.alpha_composite(ring_layer)
+    disc.alpha_composite(_rim_light(d, accent, strength=64))
+
+    disc = disc.resize((diameter, diameter), Image.LANCZOS)
+    final_mask = _circle_mask(diameter, supersample=2, feather=0.8)
+    return disc, final_mask
+
+
+# =============================================================================
+# LOGO
+# =============================================================================
+
+def _load_logo() -> Image.Image | None:
+    if not os.path.exists(LOGO_PATH):
+        logger.warning("Zensar logo not found at %s — banner will render without it", LOGO_PATH)
+        return None
+    try:
+        return Image.open(LOGO_PATH).convert("RGBA")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not open logo: %s", exc)
+        return None
+
+
+def _logo_alpha(logo: Image.Image) -> Image.Image:
+    """
+    Build a usable alpha mask from a flat-black logo.
+
+    Handles both shapes we see in practice:
+      * PNG with real transparency -> use its alpha directly
+      * black artwork on an opaque white background -> derive alpha from
+        inverted luminance, so the black strokes become the opaque part
+    """
+    alpha = logo.split()[3]
+    extrema = alpha.getextrema()
+    if extrema[0] < 250:  # genuine transparency present
+        return alpha
+
+    grey = logo.convert("L")
+    derived = ImageChops.invert(grey)
+    # stretch so near-white background goes fully transparent
+    return derived.point(lambda p: 0 if p < 26 else min(255, int((p - 26) * 1.35)))
+
+
+def _recolour_logo(logo: Image.Image, colour: tuple[int, int, int]) -> Image.Image:
+    """Repaint a monochrome logo in a solid colour, preserving its shape and edges."""
+    alpha = _logo_alpha(logo)
+    out = Image.new("RGBA", logo.size, colour + (0,))
+    out.putalpha(alpha)
+    return out
+
+
+def _place_logo(canvas: Image.Image, logo: Image.Image | None,
+                target_h: int, margin_x: int, margin_y: int,
+                position: str = "bottom-right") -> None:
+    """
+    Auto black/white selection: measure the luminance of the pixels the logo will
+    actually cover, then choose the version with the stronger contrast. A soft
+    plate is added only when the area behind it is too busy to guarantee contrast.
+    """
+    if logo is None:
+        return
+
+    ratio = logo.width / logo.height
+    lw, lh = max(1, int(target_h * ratio)), target_h
+
+    if position == "bottom-right":
+        x, y = canvas.width - margin_x - lw, canvas.height - margin_y - lh
+    elif position == "bottom-left":
+        x, y = margin_x, canvas.height - margin_y - lh
+    elif position == "top-right":
+        x, y = canvas.width - margin_x - lw, margin_y
+    else:
+        x, y = margin_x, margin_y
+
+    pad = int(lh * 0.35)
+    probe = (x - pad, y - pad, x + lw + pad, y + lh + pad)
+    lum = _region_luminance(canvas, probe)
+
+    patch = canvas.convert("RGB").crop((
+        max(0, probe[0]), max(0, probe[1]),
+        min(canvas.width, probe[2]), min(canvas.height, probe[3]),
+    ))
+    busy = ImageStat.Stat(patch.convert("L")).stddev[0]
+
+    colour = (17, 17, 17) if lum > 150 else (255, 255, 255)
+
+    # High local variance means neither pure white nor pure black is safe.
+    if busy > 58:
+        plate_colour = (255, 255, 255) if lum > 150 else (10, 12, 18)
+        _frosted_panel(
+            canvas, (x - pad, y - int(pad * 0.8), x + lw + pad, y + lh + int(pad * 0.8)),
+            radius=int(lh * 0.35), tint=plate_colour, tint_alpha=150, blur=14,
+        )
+        colour = (17, 17, 17) if plate_colour == (255, 255, 255) else (255, 255, 255)
+
+    coloured = _recolour_logo(logo, colour).resize((lw, lh), Image.LANCZOS)
+    canvas.alpha_composite(coloured, (x, y))
+
+
+# =============================================================================
+# LAYOUT
+# =============================================================================
+
+def _canvas_size(aspect_ratio: str) -> tuple[int, int]:
+    if aspect_ratio in CANVAS_SIZES:
+        return CANVAS_SIZES[aspect_ratio]
+    try:
+        a, b = aspect_ratio.split(":")
+        rw, rh = float(a), float(b)
+    except Exception:  # noqa: BLE001
+        return CANVAS_SIZES["16:9"]
+    if rw >= rh:
+        w = 1920
+        h = int(round(w * rh / rw / 2) * 2)
+    else:
+        h = 1600
+        w = int(round(h * rw / rh / 2) * 2)
+    return (w, h)
+
+
+def _build_layout(width: int, height: int, count: int) -> dict[str, Any]:
+    """
+    Compute every rectangle up front. Two reasons:
+      1. the LLM prompt can name the exact reserved zones as percentages
+      2. compositing becomes pure arithmetic with no surprises
+    """
+    landscape = width >= height
+    count = max(1, min(MAX_RECIPIENTS, count))
+
+    if landscape:
+        title_top = height * 0.075
+        title_h = height * 0.130
+        desc_top = height * 0.242
+        desc_h = height * 0.100
+        grid_cols, grid_rows = count, 1
+        disc_factor = {1: 0.36, 2: 0.31, 3: 0.27, 4: 0.235}[count]
+    else:
+        title_top = height * 0.060
+        title_h = height * 0.095
+        desc_top = height * 0.170
+        desc_h = height * 0.085
+        grid_cols, grid_rows = (count, 1) if count <= 2 else (2, 2)
+        disc_factor = {1: 0.30, 2: 0.26, 3: 0.22, 4: 0.22}[count]
+
+    # Card height is derived from what actually goes in it (see CARD_CONTENT_H
+    # in compose_banner) rather than guessed, so there is no dead space below
+    # the achievement pill.
+    disc = int(min(width, height) * disc_factor * (1.0 if landscape else 1.30))
+    card_w = int(disc * 1.58)
+    card_h = int(disc * 1.76)
+    gap_x = int(card_w * 0.15)
+    gap_y = int(card_h * 0.10)
+
+    # Free band: everything between the description and the logo strip.
+    band_top = desc_top + desc_h + height * 0.020
+    band_bottom = height - height * (0.115 if landscape else 0.090)
+    band_h = max(1.0, band_bottom - band_top)
+
+    def fits() -> tuple[float, float]:
+        return (grid_cols * card_w + (grid_cols - 1) * gap_x,
+                grid_rows * card_h + (grid_rows - 1) * gap_y)
+
+    total_w, total_h = fits()
+    shrink = min(1.0, (width * 0.92) / total_w, band_h / total_h)
+    if shrink < 1.0:
+        card_w, card_h = int(card_w * shrink), int(card_h * shrink)
+        disc, gap_x, gap_y = int(disc * shrink), int(gap_x * shrink), int(gap_y * shrink)
+        total_w, total_h = fits()
+
+    start_x = (width - total_w) // 2
+    start_y = int(band_top + (band_h - total_h) / 2)
+
+    cards: list[dict[str, int]] = []
+    for index in range(count):
+        col, row = index % grid_cols, index // grid_cols
+        in_row = min(grid_cols, count - row * grid_cols)
+        row_w = in_row * card_w + (in_row - 1) * gap_x
+        rx = (width - row_w) // 2
+        x = rx + col * (card_w + gap_x)
+        y = start_y + row * (card_h + gap_y)
+        cards.append({
+            "x": x, "y": y, "w": card_w, "h": card_h,
+            "disc": disc,
+            "disc_x": x + (card_w - disc) // 2,
+            "disc_y": y + int(card_h * 0.075),
+        })
+
+    return {
+        "width": width, "height": height, "landscape": landscape,
+        "margin_x": int(width * 0.065),
+        "title_box": (int(width * 0.08), int(title_top), int(width * 0.92), int(title_top + title_h)),
+        "desc_box": (int(width * 0.13), int(desc_top), int(width * 0.87), int(desc_top + desc_h)),
+        "cards": cards,
+        "logo_h": int(height * (0.052 if landscape else 0.038)),
+        "logo_margin_x": int(width * 0.045),
+        "logo_margin_y": int(height * 0.045),
+    }
+
+
+# =============================================================================
+# BACKGROUND PLATE
+# =============================================================================
+
+def build_plate_prompt(llm, *, title: str, description: str, theme: str,
+                       template_id: str, background_style: str, aspect_ratio: str,
+                       accent_hex: str, layout: dict[str, Any], count: int) -> str:
+    """
+    Ask the text LLM for an image prompt that describes an EMPTY STAGE.
+
+    Note what is deliberately excluded: people, faces, text, logos. Anything the
+    image model draws in those categories is something we would have to cover up
+    or fight later, so we simply never ask for it.
+    """
+    preset = TEMPLATE_PRESETS.get(template_id, TEMPLATE_PRESETS["employee-recognition"])
+    style_desc = BACKGROUND_STYLES.get(background_style, BACKGROUND_STYLES["corporate-blue-gradient"])
+
+    h, w = layout["height"], layout["width"]
+    tb, db = layout["title_box"], layout["desc_box"]
+    cards = layout["cards"]
+    card_top = min(c["y"] for c in cards)
+    card_bottom = max(c["y"] + c["h"] for c in cards)
+    card_left = min(c["x"] for c in cards)
+    card_right = max(c["x"] + c["w"] for c in cards)
+
+    def pct(v: float, total: int) -> int:
+        return int(round(v / total * 100))
+
+    meta_prompt = f"""
+You are an art director writing a single image-generation prompt for a corporate
+award-banner BACKGROUND PLATE.
+
+This plate is a backdrop only. Real photographs, real text and a real logo are
+composited on top of it afterwards by a separate deterministic renderer.
+
+CONTEXT (for mood only — do NOT render any of these words into the image):
+• Occasion  : {title}
+• Message   : {description}
+• Theme     : {theme}
+• Mood      : {preset['mood']}
+• Palette   : anchor colour {accent_hex}; {style_desc}
+• Ratio     : {aspect_ratio}
+
+ABSOLUTE EXCLUSIONS — the prompt you write must forbid all of these:
+1. NO people, NO faces, NO human figures, NO silhouettes, NO hands, NO body parts.
+2. NO text, NO letters, NO numbers, NO words, NO typography of any kind.
+3. NO logos, NO wordmarks, NO badges with writing, NO watermarks.
+4. NO empty picture frames, NO portrait placeholders, NO avatar circles,
+   NO podium figures, NO trophy engraved with text.
+
+RESERVED CLEAN ZONES — these areas must stay visually calm: low contrast, no
+busy detail, no focal elements, nothing the eye catches on:
+• Top band, {pct(tb[1], h)}%–{pct(db[3], h)}% of height, full width — headline area.
+• Centre block, {pct(card_left, w)}%–{pct(card_right, w)}% width and
+  {pct(card_top, h)}%–{pct(card_bottom, h)}% height — recipient area
+  ({count} card{'s' if count > 1 else ''} will be placed here).
+• Bottom-right corner, last 22% width and last 14% height — logo area;
+  keep it a flat, even tone.
+
+WHAT THE PLATE SHOULD CONTAIN:
+• A rich, premium, full-bleed abstract environment: {style_desc}
+• Depth via soft gradients, gentle bokeh, subtle light rays or glass reflections
+• Decorative interest pushed to the EDGES and CORNERS, away from the reserved zones
+• Optional non-figurative motifs: light ribbons, geometric line-work, particle
+  glow, soft laurel-like abstract curves — all subtle, none in the reserved zones
+• Even, predictable tone in the reserved zones so overlaid white or dark text
+  stays legible
+
+OUTPUT RULES:
+• Return ONLY the final image-generation prompt. No preamble, no markdown.
+• Restate the exclusions and the reserved zones inside the prompt you produce.
+• End with: "aspect ratio {aspect_ratio}, ultra high resolution, clean, premium."
+
+Write the background plate prompt now.
+"""
+    response = llm.invoke(meta_prompt)
+    prompt = (getattr(response, "content", None) or str(response)).strip()
+    logger.info("Plate prompt (%s): %s...", aspect_ratio, prompt[:220])
+    return prompt
+
+
+def _procedural_plate(width: int, height: int, accent: tuple[int, int, int],
+                      background_style: str) -> Image.Image:
+    """
+    Deterministic fallback plate. Used when Gemini errors, rate-limits, or returns
+    nothing — the endpoint still produces a presentable banner rather than a 500.
+    """
+    light = background_style in LIGHT_STYLES
+    if light:
+        top, bottom = (250, 251, 253), (228, 233, 241)
+    else:
+        top = _mix(accent, (8, 12, 30), 0.55)
+        bottom = _mix(accent, (2, 4, 14), 0.82)
+
+    base = Image.new("RGB", (width, height))
+    draw = ImageDraw.Draw(base)
+    for y in range(height):
+        t = y / max(1, height - 1)
+        draw.line([(0, y), (width, y)], fill=_mix(top, bottom, t))
+
+    glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    radius = int(min(width, height) * 0.75)
+    gd.ellipse(
+        (int(width * 0.62) - radius, int(height * 0.10) - radius,
+         int(width * 0.62) + radius, int(height * 0.10) + radius),
+        fill=accent + ((46,) if not light else (26,)),
+    )
+    gd.ellipse(
+        (int(width * 0.05) - radius // 2, int(height * 0.95) - radius // 2,
+         int(width * 0.05) + radius // 2, int(height * 0.95) + radius // 2),
+        fill=_mix(accent, (255, 255, 255), 0.4) + (30,),
+    )
+    glow = glow.filter(ImageFilter.GaussianBlur(int(min(width, height) * 0.12)))
+    base = Image.alpha_composite(base.convert("RGBA"), glow).convert("RGB")
+
+    vignette = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(vignette).ellipse(
+        (int(-width * 0.18), int(-height * 0.18), int(width * 1.18), int(height * 1.18)), fill=255
+    )
+    vignette = vignette.filter(ImageFilter.GaussianBlur(int(min(width, height) * 0.09)))
+    dark = Image.new("RGB", (width, height), (0, 0, 0) if not light else (190, 196, 208))
+    base = Image.composite(base, dark, vignette)
+    return base
+
+
+async def _generate_plate(prompt: str, db: AsyncSession, width: int, height: int,
+                          accent: tuple[int, int, int], background_style: str) -> tuple[Image.Image, bool]:
+    """Returns (plate, used_ai). Never raises — falls back to the procedural plate."""
+    try:
+        result = await image_llm_aexecute(prompt=prompt, db=db)
+        if result.get("status_code") == 200 and result.get("image_bytes"):
+            plate = _open_rgb(result["image_bytes"])
+            plate = _smart_crop(plate, width, height) if plate.size != (width, height) else plate
+            return plate, True
+        logger.warning("Plate generation returned no image: %s", result.get("message") or result.get("error"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Plate generation failed, using procedural fallback: %s", exc)
+
+    return _procedural_plate(width, height, accent, background_style), False
+
+
+# =============================================================================
+# COMPOSITOR
+# =============================================================================
+
+def compose_banner(plate: Image.Image, *, title: str, description: str,
+                   recipients: list[dict[str, Any]], accent: tuple[int, int, int],
+                   layout: dict[str, Any], background_style: str,
+                   logo: Image.Image | None) -> Image.Image:
+    """Draw everything on top of the plate. Pure, deterministic, no network."""
+    canvas = plate.convert("RGBA")
+    width, height = layout["width"], layout["height"]
+
+    light_plate = _region_luminance(canvas, (0, 0, width, height)) > 145
+    ink = (17, 22, 34) if light_plate else (255, 255, 255)
+    sub_ink = _mix(ink, (128, 132, 142), 0.42)
+
+    # ---- 1. TITLE -----------------------------------------------------------
+    draw = ImageDraw.Draw(canvas)
+    tb = layout["title_box"]
+    _scrim(canvas, (tb[0] - 40, tb[1] - 30, tb[2] + 40, layout["desc_box"][3] + 30),
+           dark=not light_plate, strength=0.40, blur=70)
+
+    draw = ImageDraw.Draw(canvas)
+    title_max_w = tb[2] - tb[0]
+    title_h = tb[3] - tb[1]
+    title_font = _fit_font(draw, title.upper(), "black", title_max_w, int(title_h * 0.82))
+    title_cx = (tb[0] + tb[2]) // 2
+    title_cy = (tb[1] + tb[3]) // 2
+    _draw_text(draw, (title_cx, title_cy), title.upper(), title_font, ink,
+               shadow=(0, 0, 0, 130) if not light_plate else (255, 255, 255, 120))
+
+    # accent underline
+    rule_w = int(min(title_max_w * 0.9, _text_size(draw, title.upper(), title_font)[0] * 0.5))
+    rule_y = tb[3] + int(height * 0.008)
+    draw.rounded_rectangle(
+        (title_cx - rule_w // 2, rule_y, title_cx + rule_w // 2, rule_y + max(3, int(height * 0.005))),
+        radius=height // 200, fill=accent + (255,),
+    )
+
+    # ---- 2. DESCRIPTION -----------------------------------------------------
+    # Shrink until it fits in at most two lines inside its own band. The old
+    # failure mode was a fixed font size overflowing down into the card row.
+    db_ = layout["desc_box"]
+    desc_w = db_[2] - db_[0]
+    desc_h = db_[3] - db_[1]
+    desc_font = _font("medium", int(height * 0.034))
+    desc_lines: list[str] = []
+    size = int(height * 0.034)
+    while size > 10:
+        desc_font = _font("medium", size)
+        desc_lines = _wrap(draw, description, desc_font, desc_w)
+        line_h = int(size * 1.34)
+        if len(desc_lines) <= 2 and len(desc_lines) * line_h <= desc_h:
+            break
+        size = int(size * 0.92) - 1
+    desc_lines = desc_lines[:2]
+
+    line_h = int(size * 1.34)
+    dy = db_[1] + (desc_h - len(desc_lines) * line_h) // 2 + line_h // 2
+    for line in desc_lines:
+        _draw_text(draw, ((db_[0] + db_[2]) // 2, dy), line, desc_font, sub_ink,
+                   shadow=(0, 0, 0, 90) if not light_plate else None)
+        dy += line_h
+
+    # ---- 3. RECIPIENT CARDS -------------------------------------------------
+    for card, person in zip(layout["cards"], recipients):
+        x, y, cw, ch = card["x"], card["y"], card["w"], card["h"]
+        disc = card["disc"]
+
+        ambient = _region_mean_rgb(canvas, (x, y, x + cw, y + ch))
+        panel_tint = _mix(ambient, (255, 255, 255) if light_plate else (0, 0, 0), 0.35)
+
+        _frosted_panel(
+            canvas, (x, y, x + cw, y + ch), radius=int(cw * 0.09),
+            tint=panel_tint, tint_alpha=64, blur=26,
+            border=(_mix(ink, ambient, 0.55) + (70,)),
+        )
+
+        photo = person.get("_image")
+        dx, dy_ = card["disc_x"], card["disc_y"]
+        if photo is not None:
+            local_ambient = _region_mean_rgb(canvas, (dx, dy_, dx + disc, dy_ + disc))
+            ring = _mix(accent, (255, 255, 255), 0.15)
+            hero, mask = _render_photo_disc(photo, disc, local_ambient, accent, ring)
+            # A heavy shadow reads as a grey halo on light plates, so weight it
+            # to the plate rather than using one fixed value.
+            _paste_shadow(canvas, mask, (dx, dy_),
+                          blur=int(disc * 0.085), offset=(0, int(disc * 0.055)),
+                          opacity=90 if light_plate else 130,
+                          spread=int(disc * 0.004))
+            canvas.alpha_composite(hero, (dx, dy_))
+        else:
+            ph = Image.new("RGBA", (disc, disc), _mix(ambient, ink, 0.25) + (200,))
+            ph.putalpha(_circle_mask(disc))
+            canvas.alpha_composite(ph, (dx, dy_))
+
+        draw = ImageDraw.Draw(canvas)
+        text_cx = x + cw // 2
+        name_y = dy_ + disc + int(ch * 0.095)
+
+        name = (person.get("name") or "").strip()
+        name_font = _fit_font(draw, name, "bold", int(cw * 0.88), int(disc * 0.155))
+        _draw_text(draw, (text_cx, name_y), name, name_font, ink,
+                   shadow=(0, 0, 0, 110) if not light_plate else None)
+
+        achievement = (person.get("achievement") or "").strip()
+        if achievement:
+            ach_font = _fit_font(draw, achievement, "medium", int(cw * 0.86), int(disc * 0.100))
+            # Clearance must exceed the name's descender depth, or the pill
+            # crops the tails of letters like g, y and p.
+            ach_y = name_y + int(disc * 0.215)
+            pill_w = _text_size(draw, achievement, ach_font)[0] + int(disc * 0.16)
+            pill_h = int(disc * 0.170)
+            draw.rounded_rectangle(
+                (text_cx - pill_w // 2, ach_y - pill_h // 2,
+                 text_cx + pill_w // 2, ach_y + pill_h // 2),
+                radius=pill_h // 2, fill=accent + (215,),
+            )
+            _draw_text(draw, (text_cx, ach_y), achievement, ach_font, (255, 255, 255), shadow=None)
+
+    # ---- 4. LOGO ------------------------------------------------------------
+    _place_logo(canvas, logo, layout["logo_h"],
+                layout["logo_margin_x"], layout["logo_margin_y"], position="bottom-right")
+
+    return canvas.convert("RGB")
+
+
+# =============================================================================
+# PUBLIC API
+# =============================================================================
+
+async def generate_sales_banner(
+    *,
+    title: str,
+    description: str,
+    recipients: list[dict[str, Any]],
+    db: AsyncSession,
+    domain: HLSDomainType | str = "sales",
+    theme: str = "Award Recognition",
+    template_id: str = "employee-recognition",
+    background_style: str = "corporate-blue-gradient",
+    aspect_ratio: str = "16:9",
+    accent_color: str = "",
+) -> tuple[bytes, dict[str, Any]]:
+    """
+    Core entry point. Returns (png_bytes, meta).
+
+    `recipients` is a list of {"name", "photo" (data URL or base64), "achievement"}.
+    Photos are decoded here and never leave this process.
+    """
+    recipients = (recipients or [])[:MAX_RECIPIENTS]
+    if not recipients:
+        raise ValueError("At least one recipient is required")
+
+    preset = TEMPLATE_PRESETS.get(template_id, TEMPLATE_PRESETS["employee-recognition"])
+    accent = _hex_to_rgb(accent_color or preset["accent"])
+
+    width, height = _canvas_size(aspect_ratio)
+    layout = _build_layout(width, height, len(recipients))
+
+    # Decode photos up front so a bad upload fails fast and cheap.
+    missing: list[str] = []
+    for index, person in enumerate(recipients):
+        data = _decode_data_url(person.get("photo"))
+        if not data:
+            missing.append(person.get("name") or f"Recipient {index + 1}")
+            person["_image"] = None
+            continue
+        try:
+            person["_image"] = _open_rgb(data)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Bad photo for recipient %s: %s", index + 1, exc)
+            person["_image"] = None
+            missing.append(person.get("name") or f"Recipient {index + 1}")
+
+    # 1 + 2. plate prompt, then plate
+    try:
+        llm = await initialize_5o_mini_llm(db=db, domain=domain)
+        plate_prompt = build_plate_prompt(
+            llm, title=title, description=description, theme=theme,
+            template_id=template_id, background_style=background_style,
+            aspect_ratio=aspect_ratio, accent_hex=accent_color or preset["accent"],
+            layout=layout, count=len(recipients),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Plate prompt LLM failed, using static prompt: %s", exc)
+        plate_prompt = (
+            f"Premium corporate award banner background plate, {BACKGROUND_STYLES.get(background_style, '')}, "
+            f"anchor colour {accent_color or preset['accent']}. Absolutely no people, no faces, no text, "
+            f"no letters, no logos, no empty frames. Keep the top band, the horizontal centre band and the "
+            f"bottom-right corner calm, low contrast and free of detail. Decorative interest only at the "
+            f"edges and corners. aspect ratio {aspect_ratio}, ultra high resolution, clean, premium."
+        )
+
+    plate, used_ai = await _generate_plate(plate_prompt, db, width, height, accent, background_style)
+
+    # 3 + 4. composite
+    banner = compose_banner(
+        plate, title=title, description=description, recipients=recipients,
+        accent=accent, layout=layout, background_style=background_style,
+        logo=_load_logo(),
+    )
+
+    buffer = io.BytesIO()
+    banner.save(buffer, "PNG", optimize=True)
+
+    meta = {
+        "width": width, "height": height, "aspect_ratio": aspect_ratio,
+        "ai_background": used_ai, "recipients": len(recipients),
+        "photos_missing": missing, "plate_prompt": plate_prompt,
+    }
+    return buffer.getvalue(), meta
+
+
+async def handle_sales_banner(request: Request, domain: HLSDomainType, db: AsyncSession):
+    """
+    FastAPI handler for POST /batch_process/sales_platform/banner/generate
+
+    Returns the JSON shape SalesBannerGenerator.tsx already reads:
+        { "success": true, "image_base64": "<...>", "transaction_uuid": "..." }
+    """
+    try:
+        data = await request.json()
+
+        title = (data.get("title") or "").strip()
+        description = (data.get("description") or "").strip()
+        recipients = data.get("employees") or data.get("recipients") or []
+
+        if not title:
+            return JSONResponse({"success": False, "error": "Banner title is required"}, status_code=400)
+        if not description:
+            return JSONResponse({"success": False, "error": "Description is required"}, status_code=400)
+        if not recipients:
+            return JSONResponse({"success": False, "error": "At least one recipient is required"}, status_code=400)
+
+        count = int(data.get("number_of_employees") or len(recipients))
+        recipients = recipients[:max(1, min(MAX_RECIPIENTS, count))]
+
+        for index, person in enumerate(recipients):
+            if not (person.get("name") or "").strip():
+                return JSONResponse(
+                    {"success": False, "error": f"Recipient {index + 1} name is required"}, status_code=400
+                )
+            if not person.get("photo"):
+                return JSONResponse(
+                    {"success": False, "error": f"Recipient {index + 1} photo is required"}, status_code=400
+                )
+
+        transaction_uuid = (data.get("transaction_uuid") or str(uuid_lib.uuid4())).strip()
+
+        png_bytes, meta = await generate_sales_banner(
+            title=title,
+            description=description,
+            recipients=recipients,
+            db=db,
+            domain=domain,
+            theme=data.get("theme") or "Award Recognition",
+            template_id=data.get("template_id") or "employee-recognition",
+            background_style=data.get("background_style") or "corporate-blue-gradient",
+            aspect_ratio=data.get("aspect_ratio") or "16:9",
+            accent_color=data.get("accent_color") or "",
+        )
+
+        # Optional persistence — mirrors sample banner.py, safe to remove.
+        output_path = None
+        user_id = data.get("user_id")
+        try:
+            output_folder = data.get("output_folder") or os.path.join(
+                os.environ.get("HLS_UPLOADS_PATH", os.path.join(os.getcwd(), "src", "hls_uploads")),
+                transaction_uuid, "output_folder",
+            )
+            os.makedirs(output_folder, exist_ok=True)
+            file_name = f"sales_banner_{_slugify(title)}_{aspect_tag(data.get('aspect_ratio') or '16:9')}.png"
+            output_path = os.path.join(output_folder, file_name)
+            counter = 1
+            while os.path.exists(output_path):
+                counter += 1
+                output_path = os.path.join(output_folder, f"{os.path.splitext(file_name)[0]}_{counter}.png")
+            with open(output_path, "wb") as handle:
+                handle.write(png_bytes)
+
+            if user_id:
+                db.add(HLSTransaction(
+                    uuid=transaction_uuid,
+                    format_type="sales_banner",
+                    input_file_paths=json.dumps([]),
+                    output_file_path=os.path.abspath(output_path),
+                    created_by=str(user_id),
+                    created_person=str(data.get("user_name") or ""),
+                    domain=domain,
+                ))
+                await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Sales banner persistence skipped: %s", exc)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+
+        return JSONResponse({
+            "success": True,
+            "status": "success",
+            "image_base64": base64.b64encode(png_bytes).decode("ascii"),
+            "transaction_uuid": transaction_uuid,
+            "output_file_path": output_path,
+            "meta": {k: v for k, v in meta.items() if k != "plate_prompt"},
+        })
+
+    except ValueError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error in handle_sales_banner: %s", exc)
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+def aspect_tag(aspect_ratio: str) -> str:
+    return (aspect_ratio or "16x9").replace(":", "x")
 
