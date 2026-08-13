@@ -97,12 +97,12 @@ interface SalesBannerGeneratorProps {
   onBack?: () => void;
 }
 
-/** Segmented option button — same look as the "Target Slide Count" pills. */
+/** Segmented option button — compact version of the "Target Slide Count" pills. */
 function segmentClass(active: boolean): string {
   return [
-    'rounded-lg border px-4 py-3 text-center text-sm font-semibold transition-all',
+    'rounded-md border px-2.5 py-1.5 text-center text-xs font-semibold transition-all',
     active
-      ? 'border-blue-600 bg-blue-600 text-white shadow-md'
+      ? 'border-blue-600 bg-blue-600 text-white shadow-sm'
       : 'border-slate-300 bg-white text-slate-600 hover:border-blue-400 hover:text-blue-700',
   ].join(' ');
 }
@@ -285,47 +285,47 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3">
+      <div className="flex max-h-[94vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
         {/* ===== Header ===== */}
-        <div className="flex items-start justify-between px-8 pb-5 pt-7">
+        <div className="flex items-center justify-between px-5 py-3">
           <div>
-            <h1 className="text-2xl font-bold text-slate-900">Award Banner</h1>
-            <p className="mt-1 text-sm text-slate-500">Powered by multi-agent LLM chain</p>
+            <h1 className="text-base font-bold leading-tight text-slate-900">Banner Generator</h1>
+            <p className="text-xs text-slate-500">Powered by multi-agent LLM chain</p>
           </div>
           <button
             type="button"
             onClick={handleClose}
             aria-label="Close"
-            className="rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+            className="rounded-md p-1 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
           >
-            <X size={22} />
+            <X size={18} />
           </button>
         </div>
         <div className="border-b border-blue-100" />
 
         {/* ===== Scrollable body ===== */}
-        <div className="flex-1 space-y-9 overflow-y-auto px-8 py-7">
+        <div className="flex-1 space-y-4 overflow-y-auto px-5 py-3">
           {/* Banner Content */}
           <section>
-            <h2 className="mb-4 text-lg font-bold text-slate-900">Banner Content</h2>
-            <div className="space-y-4">
+            <h2 className="mb-2 text-sm font-bold text-slate-900">Banner Content</h2>
+            <div className="space-y-2.5">
               <div>
-                <label className="mb-2 block text-sm text-slate-600">Banner Title *</label>
+                <label className="mb-1 block text-xs text-slate-600">Banner Title *</label>
                 <input
                   value={bannerTitle}
                   onChange={(e) => setBannerTitle(e.target.value)}
                   placeholder="e.g., Annual Awards Ceremony"
-                  className="w-full rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
+                  className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
                 />
               </div>
               <div>
-                <label className="mb-2 block text-sm text-slate-600">Description *</label>
+                <label className="mb-1 block text-xs text-slate-600">Description *</label>
                 <textarea
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   placeholder="e.g., Recognizing excellence and outstanding performance"
-                  className="min-h-[72px] w-full resize-none rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
+                  className="min-h-[48px] w-full resize-none rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
                 />
               </div>
             </div>
@@ -333,8 +333,8 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Template */}
           <section>
-            <h2 className="mb-4 text-lg font-bold text-slate-900">Template</h2>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <h2 className="mb-2 text-sm font-bold text-slate-900">Template</h2>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               {bannerTemplates.map((template) => (
                 <button
                   key={template.id}
@@ -346,22 +346,22 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
                 </button>
               ))}
             </div>
-            <p className="mt-3 text-sm text-indigo-500">{activeTemplate.summary}</p>
+            <p className="mt-1.5 text-xs text-indigo-500">{activeTemplate.summary}</p>
           </section>
 
           {/* Theme / Category */}
           <section>
-            <h2 className="mb-4 text-lg font-bold text-slate-900">Theme &amp; Category</h2>
-            <div className="flex flex-wrap gap-2.5">
+            <h2 className="mb-2 text-sm font-bold text-slate-900">Theme &amp; Category</h2>
+            <div className="flex flex-wrap gap-1.5">
               {themeOptions.map((opt) => (
                 <button
                   key={opt}
                   type="button"
                   onClick={() => setTheme(opt)}
                   className={[
-                    'rounded-full border px-4 py-2 text-sm font-medium transition-all',
+                    'rounded-full border px-2.5 py-1 text-xs font-medium transition-all',
                     theme === opt
-                      ? 'border-blue-600 bg-blue-600 text-white shadow-md'
+                      ? 'border-blue-600 bg-blue-600 text-white shadow-sm'
                       : 'border-slate-300 bg-white text-slate-600 hover:border-blue-400 hover:text-blue-700',
                   ].join(' ')}
                 >
@@ -373,8 +373,8 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Background Style */}
           <section>
-            <h2 className="mb-4 text-lg font-bold text-slate-900">Background Style</h2>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <h2 className="mb-2 text-sm font-bold text-slate-900">Background Style</h2>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               {backgroundStyleOptions.map((opt) => (
                 <button
                   key={opt.id}
@@ -386,7 +386,7 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
                 </button>
               ))}
             </div>
-            <p className="mt-3 text-sm text-indigo-500">
+            <p className="mt-1.5 text-xs text-indigo-500">
               The background is generated fresh in this style — recipient photos are pasted in as-is
               and never redrawn or altered.
             </p>
@@ -394,8 +394,8 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Aspect Ratio */}
           <section>
-            <h2 className="mb-4 text-lg font-bold text-slate-900">Aspect Ratio</h2>
-            <div className="grid grid-cols-4 gap-3">
+            <h2 className="mb-2 text-sm font-bold text-slate-900">Aspect Ratio</h2>
+            <div className="grid grid-cols-4 gap-2">
               {aspectRatioOptions.map((opt) => (
                 <button
                   key={opt.value}
@@ -406,7 +406,7 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
                   <span className="block">{opt.label}</span>
                   <span
                     className={[
-                      'mt-0.5 block text-xs font-normal',
+                      'block text-[10px] font-normal',
                       aspectRatio === opt.value ? 'text-blue-100' : 'text-slate-400',
                     ].join(' ')}
                   >
@@ -419,14 +419,14 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Recipients */}
           <section>
-            <h2 className="mb-4 flex items-center gap-2 text-lg font-bold text-slate-900">
-              <Users size={19} className="text-blue-600" />
+            <h2 className="mb-2 flex items-center gap-1.5 text-sm font-bold text-slate-900">
+              <Users size={15} className="text-blue-600" />
               Recipients
             </h2>
 
-            <div className="mb-5">
-              <label className="mb-2 block text-sm text-slate-600">Number of Recipients *</label>
-              <div className="grid grid-cols-4 gap-3">
+            <div className="mb-3">
+              <label className="mb-1 block text-xs text-slate-600">Number of Recipients *</label>
+              <div className="grid grid-cols-4 gap-2">
                 {recipientCountOptions.map((n) => (
                   <button
                     key={n}
@@ -440,58 +440,58 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
               </div>
             </div>
 
-            <div className="space-y-4">
+            <div className="space-y-2.5">
               {Array.from({ length: numberOfEmployees }).map((_, index) => (
-                <div key={index} className="rounded-xl border border-slate-200 bg-slate-50 p-5">
-                  <p className="mb-4 text-sm font-semibold text-slate-900">Recipient {index + 1}</p>
+                <div key={index} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <p className="mb-2 text-xs font-semibold text-slate-900">Recipient {index + 1}</p>
 
-                  <div className="mb-4">
-                    <label className="mb-2 block text-sm text-slate-600">Name *</label>
+                  <div className="mb-2">
+                    <label className="mb-1 block text-xs text-slate-600">Name *</label>
                     <input
                       value={employees[index].name}
                       onChange={(e) => handleEmployeeNameChange(index, e.target.value)}
                       placeholder="Enter recipient name"
-                      className="w-full rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
+                      className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
                     />
                   </div>
 
-                  <div className="mb-4">
-                    <label className="mb-2 block text-sm text-slate-600">
+                  <div className="mb-2">
+                    <label className="mb-1 block text-xs text-slate-600">
                       Specific Achievement <span className="text-slate-400">(Optional)</span>
                     </label>
                     <textarea
                       value={employees[index].achievement || ''}
                       onChange={(e) => handleEmployeeAchievementChange(index, e.target.value)}
                       placeholder="e.g., Top Sales Performer - 150% of Target"
-                      className="min-h-[56px] w-full resize-none rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
+                      className="min-h-[40px] w-full resize-none rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
                     />
                   </div>
 
                   <div>
-                    <label className="mb-2 block text-sm text-slate-600">Photo *</label>
+                    <label className="mb-1 block text-xs text-slate-600">Photo *</label>
                     {employees[index].photo ? (
-                      <div className="flex items-center gap-4">
+                      <div className="flex items-center gap-2.5">
                         <img
                           src={employees[index].photo as string}
                           alt={`Recipient ${index + 1}`}
-                          className="h-16 w-16 rounded-lg border border-slate-200 object-cover"
+                          className="h-11 w-11 rounded-md border border-slate-200 object-cover"
                         />
-                        <span className="text-sm text-slate-500">Photo uploaded</span>
+                        <span className="text-xs text-slate-500">Photo uploaded</span>
                         <button
                           type="button"
                           onClick={() => clearEmployeePhoto(index)}
-                          className="ml-auto rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:border-red-400 hover:text-red-600"
+                          className="ml-auto rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 transition hover:border-red-400 hover:text-red-600"
                         >
                           Remove
                         </button>
                       </div>
                     ) : (
-                      <label className="flex cursor-pointer items-center gap-4">
-                        <span className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-blue-500 hover:text-blue-700">
-                          <ImagePlus size={16} />
+                      <label className="flex cursor-pointer items-center gap-2.5">
+                        <span className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:border-blue-500 hover:text-blue-700">
+                          <ImagePlus size={13} />
                           Choose File
                         </span>
-                        <span className="text-sm text-slate-400">No file chosen</span>
+                        <span className="text-xs text-slate-400">No file chosen</span>
                         <input
                           ref={(ref) => {
                             if (ref) employeePhotoInputRefs.current[index] = ref;
@@ -512,39 +512,39 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
           {/* Preview */}
           {previewUrl && (
             <section>
-              <div className="mb-4 flex items-center justify-between">
-                <h2 className="text-lg font-bold text-slate-900">Preview</h2>
+              <div className="mb-2 flex items-center justify-between">
+                <h2 className="text-sm font-bold text-slate-900">Preview</h2>
                 <button
                   type="button"
                   onClick={downloadBanner}
-                  className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+                  className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
                 >
-                  <Download size={16} />
+                  <Download size={13} />
                   Download PNG
                 </button>
               </div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
                 <img
                   src={previewUrl}
                   alt="Generated banner"
-                  className="mx-auto max-h-[380px] w-full rounded-lg object-contain shadow-md"
+                  className="mx-auto max-h-[280px] w-full rounded-md object-contain shadow-sm"
                 />
               </div>
 
               {history.length > 0 && (
-                <div className="mt-5">
-                  <p className="mb-2 text-sm text-slate-600">Recent banners</p>
-                  <div className="grid grid-cols-3 gap-3">
+                <div className="mt-3">
+                  <p className="mb-1.5 text-xs text-slate-600">Recent banners</p>
+                  <div className="grid grid-cols-3 gap-2">
                     {history.map((item, idx) => (
                       <button
                         key={idx}
                         type="button"
                         onClick={() => setPreviewUrl(item.image)}
-                        className="group relative overflow-hidden rounded-lg border border-slate-200 transition hover:border-blue-500"
+                        className="group relative overflow-hidden rounded-md border border-slate-200 transition hover:border-blue-500"
                       >
-                        <img src={item.image} alt={item.title} className="h-20 w-full object-cover" />
-                        <div className="absolute inset-0 flex items-end bg-black/0 p-2 transition group-hover:bg-black/30">
-                          <span className="truncate text-xs font-semibold text-white opacity-0 transition group-hover:opacity-100">
+                        <img src={item.image} alt={item.title} className="h-14 w-full object-cover" />
+                        <div className="absolute inset-0 flex items-end bg-black/0 p-1.5 transition group-hover:bg-black/30">
+                          <span className="truncate text-[10px] font-semibold text-white opacity-0 transition group-hover:opacity-100">
                             {item.title}
                           </span>
                         </div>
@@ -558,25 +558,25 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
 
           {/* Messages */}
           {error && (
-            <div className="flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 p-4">
-              <AlertCircle size={18} className="mt-0.5 flex-shrink-0 text-red-600" />
-              <p className="text-sm font-medium text-red-900">{error}</p>
+            <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50 p-2.5">
+              <AlertCircle size={15} className="mt-0.5 flex-shrink-0 text-red-600" />
+              <p className="text-xs font-medium text-red-900">{error}</p>
             </div>
           )}
           {success && (
-            <div className="flex items-start gap-3 rounded-lg border border-green-200 bg-green-50 p-4">
-              <Sparkles size={18} className="mt-0.5 flex-shrink-0 text-green-600" />
-              <p className="text-sm font-medium text-green-900">{success}</p>
+            <div className="flex items-start gap-2 rounded-md border border-green-200 bg-green-50 p-2.5">
+              <Sparkles size={15} className="mt-0.5 flex-shrink-0 text-green-600" />
+              <p className="text-xs font-medium text-green-900">{success}</p>
             </div>
           )}
         </div>
 
         {/* ===== Footer ===== */}
-        <div className="flex items-center justify-between border-t border-slate-200 px-8 py-5">
+        <div className="flex items-center justify-between border-t border-slate-200 px-5 py-2.5">
           <button
             type="button"
             onClick={handleClose}
-            className="rounded-lg px-4 py-2.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+            className="rounded-md px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
           >
             Cancel
           </button>
@@ -584,16 +584,16 @@ export function SalesBannerGenerator({ onClose, onBack }: SalesBannerGeneratorPr
             type="button"
             onClick={generateBanner}
             disabled={loading}
-            className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-indigo-500 to-blue-600 px-6 py-3 text-sm font-semibold text-white shadow-lg transition hover:shadow-xl disabled:cursor-not-allowed disabled:opacity-60"
+            className="inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-indigo-500 to-blue-600 px-4 py-2 text-sm font-semibold text-white shadow transition hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60"
           >
             {loading ? (
               <>
-                <Loader size={16} className="animate-spin" />
+                <Loader size={14} className="animate-spin" />
                 Generating...
               </>
             ) : (
               <>
-                <Sparkles size={16} />
+                <Sparkles size={14} />
                 Generate Banner
               </>
             )}
