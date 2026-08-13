@@ -1,1 +1,703 @@
+import base64
+import io
+import os
+import re
+import uuid
+from typing import Dict, List, Optional, Tuple
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+from sqlalchemy.ext.asyncio import AsyncSession
+from .banner import handle_banner
+from .main import hls_uploads_path
+from ..utils.utils import getOSpecifiers
+from common.llm_utils.litellm_aexecute import image_llm_aexecute
+from .hls_constants import get_constant
+from ..hls_platform.utils import initialize_5o_mini_llm
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Logo paths (standard format - mandatory on all banners)
+ZENSAR_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "zensar_logo.png")
+ONERPG_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "onerpg_logo.png")
+
+
+# Template styles (for reference/fallback accent colors)
+TEMPLATE_STYLES = {
+    "employee-recognition": {
+        "accent": (255, 201, 71),
+        "tag": "EMPLOYEE RECOGNITION",
+    },
+    "star-performer": {
+        "accent": (253, 186, 116),
+        "tag": "STAR PERFORMER",
+    },
+    "team-achievement": {
+        "accent": (134, 239, 172),
+        "tag": "TEAM ACHIEVEMENT",
+    },
+    "sales-excellence": {
+        "accent": (192, 132, 252),
+        "tag": "SALES EXCELLENCE",
+    },
+}
+
+# Sales-specific template layouts for prompt guidance
+SALES_TEMPLATE_LAYOUTS = {
+    "corporate-achievement": {
+        "layout": "structured-corporate",
+        "description": "Structured corporate layout celebrating milestones and company success",
+        "visual_style": "corporate-professional",
+    },
+    "employee-recognition": {
+        "layout": "centered-portrait-stack",
+        "description": "Professional centered layout with employees as focal points",
+        "visual_style": "corporate-elegant",
+    },
+    "sales-champion": {
+        "layout": "dynamic-spotlight",
+        "description": "Dynamic composition highlighting sales excellence",
+        "visual_style": "bold-energetic",
+    },
+    "leadership-award": {
+        "layout": "premium-symmetric",
+        "description": "Symmetric premium layout exuding leadership and authority",
+        "visual_style": "premium-formal",
+    },
+    "milestone-celebration": {
+        "layout": "celebratory-burst",
+        "description": "Celebratory composition with festive energy and milestone focus",
+        "visual_style": "vibrant-celebratory",
+    },
+    "star-performer": {
+        "layout": "spotlight-hero",
+        "description": "Hero-focused layout with dramatic emphasis on star performers",
+        "visual_style": "premium-dramatic",
+    },
+}
+
+# Aspect ratio hints for layout guidance
+SALES_ASPECT_RATIO_HINTS = {
+    "16:9": "wide horizontal canvas — arrange the photo frames in a single balanced row",
+    "1:1": "square canvas — arrange the photo frames in a centered row (1-3) or a 2x2 grid (4)",
+    "4:5": "portrait rectangle — arrange the photo frames in a 2-column grid",
+    "9:16": "tall vertical strip — arrange the photo frames stacked vertically or in a 2-column grid",
+}
+
+# Preset background styles, chosen via dropdown in the UI
+BACKGROUND_STYLE_PRESETS = {
+    "corporate-blue-gradient": (
+        "A clean corporate gradient moving through deep navy to bright blue, "
+        "with subtle geometric line accents. Professional and trustworthy."
+    ),
+    "premium-gold-navy": (
+        "A premium, formal backdrop combining navy blue with elegant gold accent "
+        "lines and soft light rays, evoking prestige and leadership."
+    ),
+    "vibrant-celebration": (
+        "An energetic celebration backdrop with dynamic light bursts, confetti-like "
+        "accents, and a vibrant multi-color gradient conveying excitement."
+    ),
+    "minimal-professional-white": (
+        "A minimal, airy background in white and light gray with soft shadows and "
+        "understated geometric accents. Clean and modern."
+    ),
+    "dark-premium-elegance": (
+        "A dark, moody premium background in charcoal and black with subtle metallic "
+        "gold or silver highlights and soft spotlight glow."
+    ),
+    "fresh-green-energy": (
+        "A fresh, energetic gradient background in green tones with light dynamic "
+        "streaks, suggesting growth, teamwork, and momentum."
+    ),
+}
+
+DEFAULT_BACKGROUND_STYLE = "corporate-blue-gradient"
+
+ASPECT_CANVAS_DIMENSIONS = {
+    "16:9": (1600, 900),
+    "1:1": (900, 900),
+    "4:5": (720, 900),
+    "9:16": (900, 1600),
+}
+
+
+# =====================================================================
+# GENERATION FLOW — TWO LLM PASSES
+# =====================================================================
+# PASS 1 (DESIGN): ALL inputs except the photos are sent to the image
+#   LLM — title, description, theme, template, background style, aspect
+#   ratio, and every recipient's name + achievement. The model designs
+#   the COMPLETE banner, including one EMPTY photo frame per recipient
+#   with that recipient's name rendered directly beneath it.
+#
+# PASS 2 (INSERT PHOTOS): the finished banner from pass 1 is sent back
+#   to the model TOGETHER WITH the real photos, each labeled with its
+#   recipient's name, and the model is asked to place each photo into
+#   the frame carrying the matching name — WITHOUT altering the photos
+#   or anything else on the banner.
+#
+#   To guarantee the model actually sees every photo (some backends
+#   drop extra image attachments — the cause of the earlier random
+#   AI faces), the pass-2 input is ONE combined image: the banner on
+#   top + a labeled reference strip of the real photos below it. The
+#   model is instructed to output ONLY the banner area, with the
+#   photos moved into their frames and the strip removed. The photos
+#   are also attached individually as a fallback.
+# =====================================================================
+
+
+def _decode_employee_photo(photo_data: str) -> Tuple[bytes, str]:
+    """
+    Decode a base64 / data-URL employee photo into (raw_bytes, mime_type).
+    Validates that the bytes are a real image by opening them with PIL.
+    Raises ValueError if the photo cannot be decoded.
+    """
+    mime = "image/jpeg"
+    encoded = photo_data
+
+    if photo_data.strip().lower().startswith("data:") and "," in photo_data:
+        header, encoded = photo_data.split(",", 1)
+        match = re.match(r"data:([^;]+);", header)
+        if match:
+            mime = match.group(1).strip().lower()
+
+    raw = base64.b64decode(encoded)
+
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    elif raw[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+
+    with Image.open(io.BytesIO(raw)) as probe:
+        probe.verify()
+
+    return raw, mime
+
+
+def _load_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
+    path = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    )
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def build_insertion_input(
+    banner_bytes: bytes,
+    photo_blobs: List[Tuple[bytes, str]],
+    names: List[str],
+) -> Tuple[bytes, str]:
+    """
+    Build the SINGLE pass-2 input image:
+      • TOP    — the pass-1 banner, untouched.
+      • BOTTOM — a white reference strip with every REAL photo, each in a
+                 bordered cell labeled with the recipient's name.
+
+    Sending this as the primary image guarantees the model sees the banner
+    AND every real face together, even if extra image attachments are
+    dropped by the backend.
+    """
+    banner = Image.open(io.BytesIO(banner_bytes)).convert("RGB")
+    bw, bh = banner.size
+    count = len(photo_blobs)
+
+    pad = max(12, bw // 100)
+    cell_w = (bw - pad * (count + 1)) // count
+    photo_h = min(int(cell_w * 1.15), int(bh * 0.45))
+    label_h = max(36, int(cell_w * 0.16))
+    strip_h = pad + photo_h + label_h + pad
+    divider_h = 6
+
+    combined = Image.new("RGB", (bw, bh + divider_h + strip_h), (255, 255, 255))
+    combined.paste(banner, (0, 0))
+
+    draw = ImageDraw.Draw(combined)
+    # Divider between banner and reference strip
+    draw.rectangle([0, bh, bw, bh + divider_h], fill=(0, 0, 0))
+
+    font_size = max(20, int(cell_w * 0.11))
+    font = _load_font(font_size, bold=True)
+
+    strip_top = bh + divider_h + pad
+    for i, (raw, _mime) in enumerate(photo_blobs):
+        name = names[i].strip() if i < len(names) and names[i].strip() else f"Recipient {i + 1}"
+
+        photo = Image.open(io.BytesIO(raw)).convert("RGB")
+        # Contain-fit: never crops the face
+        fitted = ImageOps.contain(photo, (cell_w, photo_h))
+
+        cell_x = pad + i * (cell_w + pad)
+        offset_x = cell_x + (cell_w - fitted.width) // 2
+        offset_y = strip_top + (photo_h - fitted.height) // 2
+        combined.paste(fitted, (offset_x, offset_y))
+
+        # Cell border around the photo area
+        draw.rectangle(
+            [cell_x, strip_top, cell_x + cell_w, strip_top + photo_h],
+            outline=(20, 20, 20),
+            width=3,
+        )
+
+        # Name label under the cell — shrink until it fits
+        label_font = font
+        label_size = font_size
+        while label_size > 12 and draw.textlength(name, font=label_font) > cell_w - 8:
+            label_size -= 1
+            label_font = _load_font(label_size, bold=True)
+        draw.text(
+            (cell_x + cell_w / 2, strip_top + photo_h + label_h / 2),
+            name,
+            fill=(0, 0, 0),
+            font=label_font,
+            anchor="mm",
+        )
+
+    # Keep the request light: cap the longest side and send as JPEG —
+    # oversized PNG payloads can make the model return a text-only reply.
+    max_side = 1800
+    if max(combined.size) > max_side:
+        scale = max_side / max(combined.size)
+        combined = combined.resize(
+            (int(combined.width * scale), int(combined.height * scale)), Image.LANCZOS
+        )
+
+    output = io.BytesIO()
+    combined.save(output, format="JPEG", quality=90)
+    return output.getvalue(), "image/jpeg"
+
+
+def generate_design_prompt(
+    title: str,
+    description: str,
+    template_id: str,
+    theme: str,
+    background_style: str,
+    employee_names: List[str],
+    employee_achievements: List[str],
+    aspect_ratio: str,
+    canvas_w: int,
+    canvas_h: int,
+) -> str:
+    """
+    PASS 1 prompt: ALL inputs except the photos. The model designs the
+    complete banner with one EMPTY photo frame per recipient, each frame
+    carrying that recipient's name (and achievement) directly beneath it.
+    """
+    if employee_achievements is None:
+        employee_achievements = []
+
+    layout_info = SALES_TEMPLATE_LAYOUTS.get(
+        template_id, SALES_TEMPLATE_LAYOUTS["employee-recognition"]
+    )
+    background_description = BACKGROUND_STYLE_PRESETS.get(
+        background_style, BACKGROUND_STYLE_PRESETS[DEFAULT_BACKGROUND_STYLE]
+    )
+    ratio_hint = SALES_ASPECT_RATIO_HINTS.get(aspect_ratio, "balanced canvas")
+
+    names = [n.strip() for n in employee_names[:4] if n.strip()]
+    num_employees = len(names)
+
+    recipient_lines = []
+    for idx, name in enumerate(names):
+        achievement = ""
+        if idx < len(employee_achievements) and employee_achievements[idx].strip():
+            achievement = employee_achievements[idx].strip()
+        line = f'  Frame {idx + 1} → Name: "{name}"'
+        if achievement:
+            line += f'  |  Achievement: "{achievement}"'
+        recipient_lines.append(line)
+    recipients_block = "\n".join(recipient_lines)
+
+    prompt = f"""You are a world-class professional banner designer. Create ONE complete, polished
+corporate recognition banner. The recipients' REAL photos will be inserted in a later
+step — so for now, every photo position must be an EMPTY frame.
+
+BANNER CONTENT:
+===============
+Title: {title}
+Description (subtitle): {description}
+
+BANNER SETTINGS:
+================
+Theme: {theme}
+Template: {template_id} — {layout_info['description']}
+Visual Style: {layout_info['visual_style']}
+Background Style: {background_description}
+Aspect Ratio: {aspect_ratio} ({canvas_w}x{canvas_h}px) — {ratio_hint}
+
+RECIPIENTS ({num_employees}) — ONE EMPTY FRAME PER RECIPIENT:
+=============================================================
+{recipients_block}
+
+EMPTY PHOTO FRAMES — CRITICAL:
+==============================
+• Draw EXACTLY {num_employees} identical, clearly visible photo frames: elegant
+  rounded-rectangle cards with a PLAIN, flat, neutral light-gray interior.
+• Each frame's interior must be COMPLETELY EMPTY — no person, face, silhouette,
+  avatar, icon, initials, camera symbol, or pattern inside it. Just the flat
+  neutral fill, ready to receive a real photo later.
+• Directly under each frame, render that recipient's NAME in bold, spelled
+  EXACTLY as given, and their achievement (if given) in smaller text under the
+  name. Each name and achievement appears EXACTLY ONCE, under its own frame,
+  in the order listed above (Frame 1 leftmost/topmost).
+• Never write the words "PHOTO", "IMAGE", "PLACEHOLDER" or any label inside or
+  around the frames — only the real names and achievements.
+
+DESIGN REQUIREMENTS — PROFESSIONAL QUALITY:
+===========================================
+1. LAYOUT: title dominant at the top, description as a clear subtitle beneath
+   it, frames arranged per the aspect-ratio guidance with even spacing and
+   consistent margins.
+2. TYPOGRAPHY: bold legible title, clean hierarchy, no spelling errors, all
+   text readable against the background.
+3. BACKGROUND: follow the Background Style description; premium and cohesive
+   with the theme ({theme}); strong contrast behind frames and text.
+4. BRANDING: Zensar logo top-right corner, OneRPG logo bottom-right corner —
+   mandatory.
+5. NO people, faces, silhouettes, or figures anywhere on the banner.
+
+OUTPUT:
+=======
+One complete professional banner at {aspect_ratio} ({canvas_w}x{canvas_h}px)
+with title, subtitle, background, logos, and {num_employees} EMPTY named
+frame(s) awaiting the real photos.
+
+IMPORTANT: Respond with the generated banner IMAGE only — never respond with text.
+
+Start generating now."""
+
+    return prompt
+
+
+def generate_insertion_prompt(
+    names: List[str],
+    aspect_ratio: str,
+    num_recipients: int,
+) -> str:
+    """
+    PASS 2 prompt: the combined image (banner on top + labeled real-photo
+    strip below) goes in as the primary image. The model must move each real
+    photo into the frame carrying the matching name, altering nothing else,
+    and output ONLY the banner area.
+    """
+    clean_names = [n.strip() for n in names[:4] if n.strip()]
+    mapping = "\n".join(
+        f'  • The strip photo labeled "{name}" goes INTO the empty frame that has '
+        f'"{name}" written under it.'
+        for name in clean_names
+    )
+
+    prompt = f"""The attached image has TWO parts separated by a black divider line:
+
+• TOP — a finished recognition banner containing {num_recipients} EMPTY photo
+  frame(s), each with a recipient's name written directly beneath it.
+• BOTTOM — a white reference strip containing the {num_recipients} REAL
+  photo(s) of the recipients, each in a black-bordered cell labeled with the
+  recipient's name. (The same photos may also be attached individually.)
+
+YOUR ONLY TASK:
+===============
+Place each REAL photo from the strip into the banner frame that carries the
+SAME name:
+{mapping}
+
+🚨 STRICT RULES — FOLLOW EXACTLY 🚨
+====================================
+1. USE THE PHOTOS EXACTLY AS GIVEN. To fit a photo into its frame you may ONLY
+   scale it and crop it. NEVER redraw, regenerate, repaint, retouch, beautify,
+   stylize, or alter a photo or the person in it. NEVER change a face, skin
+   tone, hair, expression, body, or clothing. NEVER substitute a generated or
+   different person. Every face in the output must be pixel-faithful to its
+   strip photo.
+2. CHANGE NOTHING ELSE ON THE BANNER. The background, title, description,
+   names, achievements, logos, colors, and layout must remain exactly as they
+   are. Only the empty frame interiors change — they get filled with the
+   matching real photos.
+3. Every frame gets filled; every photo is used exactly once; no empty frames
+   remain; no extra people or faces appear anywhere.
+4. OUTPUT ONLY THE BANNER (the top part) at its original {aspect_ratio}
+   proportions. The black divider and the white reference strip must NOT
+   appear in the output image at all.
+
+IMPORTANT: Respond with the edited banner IMAGE only — never respond with text.
+
+Produce the final banner now."""
+
+    return prompt
+
+
+async def call_image_model(
+    prompt: str,
+    db: AsyncSession,
+    image_bytes: Optional[bytes] = None,
+    image_mime: Optional[str] = None,
+    additional_images: Optional[List[Dict]] = None,
+    attempts: int = 3,
+) -> bytes:
+    """
+    Shared wrapper around image_llm_aexecute with error handling and
+    automatic retries — image models occasionally return a text-only reply
+    with no image (e.g. "LiteLLM response did not contain message.images"),
+    and a retry usually succeeds.
+    """
+    last_error = "Image generation failed"
+    for attempt in range(1, attempts + 1):
+        try:
+            result = await image_llm_aexecute(
+                prompt=prompt,
+                db=db,
+                image_bytes=image_bytes,
+                image_mime=image_mime,
+                additional_images=additional_images,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            logging.warning(f"Image model attempt {attempt}/{attempts} raised: {exc}")
+            continue
+
+        if result.get("status_code") == 200 and result.get("image_bytes"):
+            if attempt > 1:
+                print(f"✅ Image model succeeded on retry {attempt}/{attempts}")
+            return result["image_bytes"]
+
+        last_error = (
+            result.get("message")
+            or result.get("error")
+            or "The image model returned no image"
+        )
+        logging.warning(
+            f"Image model attempt {attempt}/{attempts} returned no image: {last_error}"
+        )
+
+    logging.error(f"Image model failed after {attempts} attempts: {last_error}")
+    raise ValueError(f"{last_error} (after {attempts} attempts — please try again)")
+
+
+async def sales_banner_generate_handler(request: Request, db: AsyncSession):
+    """
+    Banner generation handler — two-pass flow.
+
+    PASS 1: all inputs EXCEPT the photos go to the model, which designs the
+            complete banner with an empty named frame per recipient.
+    PASS 2: the banner + the real photos (labeled with names) go back to the
+            model, which inserts each photo into its matching frame without
+            altering the photos or anything else.
+    """
+    try:
+        payload = await request.json()
+
+        # Extract and validate ALL inputs
+        title = (payload.get("title") or "").strip()
+        description = (payload.get("description") or payload.get("subtitle") or "").strip()
+        template = payload.get("template") or payload.get("template_id") or "employee-recognition"
+        theme = (payload.get("theme") or "Professional Recognition").strip()
+        aspect_ratio = payload.get("aspect_ratio", "16:9")
+        background_style = payload.get("background_style") or DEFAULT_BACKGROUND_STYLE
+        if background_style not in BACKGROUND_STYLE_PRESETS:
+            background_style = DEFAULT_BACKGROUND_STYLE
+
+        # Employee information
+        employees_list = payload.get("employees", [])
+        number_of_employees = payload.get("number_of_employees", 0)
+
+        names = []
+        images = []
+        achievements = []
+
+        if employees_list and number_of_employees > 0:
+            for emp in employees_list[:number_of_employees]:
+                names.append(emp.get("name", "").strip() or "")
+                images.append(emp.get("photo", ""))
+                achievements.append(emp.get("achievement", "").strip() or "")
+        else:
+            # Fallback to legacy format
+            names = [n.strip() if isinstance(n, str) else "" for n in (payload.get("names") or [])]
+            images = payload.get("images") or []
+            achievements = [a.strip() if isinstance(a, str) else "" for a in (payload.get("achievements") or [])]
+
+        # VALIDATION
+        if not title:
+            return JSONResponse({"success": False, "error": "Banner title is required."}, status_code=400)
+        if not description:
+            return JSONResponse({"success": False, "error": "Banner description is required."}, status_code=400)
+
+        if not names or not images or len(names) == 0 or len(images) == 0:
+            return JSONResponse({
+                "success": False,
+                "error": "At least one employee name and photo is required."
+            }, status_code=400)
+
+        if len(images) > 4:
+            return JSONResponse({
+                "success": False,
+                "error": "Maximum 4 employee photos allowed."
+            }, status_code=400)
+
+        for idx in range(len(names)):
+            if not names[idx].strip():
+                return JSONResponse({
+                    "success": False,
+                    "error": f"Recipient {idx + 1} name is required."
+                }, status_code=400)
+            if idx >= len(images) or not images[idx]:
+                return JSONResponse({
+                    "success": False,
+                    "error": f"Recipient {idx + 1} photo is required."
+                }, status_code=400)
+
+        # Log the complete API payload
+        print("\n" + "=" * 70)
+        print("📋 SALES BANNER API PAYLOAD (ALL INPUTS)")
+        print("=" * 70)
+        print(f"Title: {title}")
+        print(f"Description: {description[:80]}...")
+        print(f"Theme: {theme}")
+        print(f"Template: {template}")
+        print(f"Background Style: {background_style}")
+        print(f"Aspect Ratio: {aspect_ratio}")
+        print(f"Employees: {len(names)} ({', '.join(names[:4])})")
+        print(f"Achievements: {len(achievements)}")
+        print("=" * 70 + "\n")
+
+        # Create working directory
+        transaction_uuid = str(uuid.uuid4())
+        uuid_path = os.path.join(hls_uploads_path, transaction_uuid)
+        output_folder = os.path.join(uuid_path, "output_folder")
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Decode ALL employee photos
+        photo_blobs: List[Tuple[bytes, str]] = []
+        for idx, photo_data in enumerate(images[:4]):
+            try:
+                raw, mime = _decode_employee_photo(photo_data)
+                photo_blobs.append((raw, mime))
+                print(f"✅ Employee photo {idx + 1} ({names[idx]}): {len(raw)} bytes ({mime})")
+            except Exception as e:
+                logging.exception(f"Failed to process employee photo {idx + 1}: {e}")
+                return JSONResponse({
+                    "success": False,
+                    "error": f"Recipient {idx + 1} photo could not be read. Please re-upload it."
+                }, status_code=400)
+
+        if not photo_blobs:
+            return JSONResponse({
+                "success": False,
+                "error": "Failed to process employee photos. Please try again."
+            }, status_code=400)
+
+        canvas_w, canvas_h = ASPECT_CANVAS_DIMENSIONS.get(
+            aspect_ratio, ASPECT_CANVAS_DIMENSIONS["16:9"]
+        )
+
+        # ============================================================
+        # PASS 1 — DESIGN: all inputs except the photos
+        # ============================================================
+        print("\n" + "=" * 70)
+        print("🎨 PASS 1/2 — BANNER DESIGN (all inputs except photos)")
+        print("=" * 70 + "\n")
+
+        design_prompt = generate_design_prompt(
+            title=title,
+            description=description,
+            template_id=template,
+            theme=theme,
+            background_style=background_style,
+            employee_names=names[:4],
+            employee_achievements=achievements[:4],
+            aspect_ratio=aspect_ratio,
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
+        )
+        print(f"📝 Design prompt: {len(design_prompt)} characters\n")
+
+        design_banner_bytes = await call_image_model(prompt=design_prompt, db=db)
+        print(f"✅ PASS 1 complete — banner with empty frames: {len(design_banner_bytes)} bytes\n")
+
+        # ============================================================
+        # PASS 2 — INSERT PHOTOS: banner + labeled real photos
+        # ============================================================
+        print("=" * 70)
+        print("🖼️  PASS 2/2 — INSERT REAL PHOTOS (banner + labeled photos)")
+        print("=" * 70 + "\n")
+
+        insertion_input_bytes, insertion_input_mime = build_insertion_input(
+            banner_bytes=design_banner_bytes,
+            photo_blobs=photo_blobs,
+            names=names[:4],
+        )
+        print(f"🧩 Combined input (banner + labeled photo strip): {len(insertion_input_bytes)} bytes")
+
+        insertion_prompt = generate_insertion_prompt(
+            names=names[:4],
+            aspect_ratio=aspect_ratio,
+            num_recipients=len(photo_blobs),
+        )
+        print(f"📝 Insertion prompt: {len(insertion_prompt)} characters\n")
+
+        # The combined image already contains the banner AND every labeled
+        # real photo, so nothing extra is attached — extra image attachments
+        # in an unexpected format can make the backend/model return a
+        # text-only reply ("LiteLLM response did not contain message.images").
+        banner_image_bytes = await call_image_model(
+            prompt=insertion_prompt,
+            db=db,
+            image_bytes=insertion_input_bytes,
+            image_mime=insertion_input_mime,
+        )
+        print(f"✅ PASS 2 complete — final banner: {len(banner_image_bytes)} bytes\n")
+
+        if not banner_image_bytes:
+            raise ValueError("Image model returned no image data")
+
+        # Save generated banner
+        ratio_tag = aspect_ratio.replace(':', 'x')
+        base_filename = f"sales_banner_{template}_{ratio_tag}"
+
+        counter = 1
+        file_name = f"{base_filename}.png"
+        file_path = os.path.join(output_folder, file_name)
+
+        while os.path.exists(file_path):
+            counter += 1
+            file_name = f"{base_filename}_{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
+
+        with open(file_path, 'wb') as f:
+            f.write(banner_image_bytes)
+
+        print(f"\n✅ Complete banner saved: {file_path}")
+        print(f"   File size: {len(banner_image_bytes)} bytes\n")
+
+        # Return as base64 JSON
+        encoded = base64.b64encode(banner_image_bytes).decode("utf-8")
+
+        return JSONResponse({
+            "success": True,
+            "filename": f"{re.sub(r'[^a-zA-Z0-9]+', '_', title).strip('_').lower() or 'sales_banner'}.png",
+            "image_base64": encoded,
+            "mime_type": "image/png",
+            "template": template,
+            "download_url": None,
+        }, status_code=200)
+
+    except ValueError as ve:
+        logging.exception(f"Validation error: {ve}")
+        return JSONResponse({
+            "success": False,
+            "error": str(ve)
+        }, status_code=400)
+
+    except Exception as exc:
+        logging.exception(f"Banner generation failed: {exc}")
+        return JSONResponse({
+            "success": False,
+            "error": f"Banner generation failed: {str(exc)}"
+        }, status_code=500)
 
