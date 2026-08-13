@@ -1,1 +1,789 @@
+import asyncio
+import base64
+import io
+import math
+import os
+import re
+import uuid
+from typing import Dict, List, Optional, Tuple
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from litellm import aimage_generation
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
+from sqlalchemy.ext.asyncio import AsyncSession
+from .banner import handle_banner
+from .main import hls_uploads_path
+from ..utils.utils import getOSpecifiers
+from .hls_constants import get_constant
+from ..hls_platform.utils import initialize_5o_mini_llm
+import logging
+
+logger = logging.getLogger(__name__)
+
+# =====================================================================
+# IMAGE MODEL — GOOGLE IMAGEN (replaces gemini-3-pro-image)
+# =====================================================================
+# Imagen is Google's dedicated image-generation model family with its
+# own quota bucket, so the tiny gemini-3-pro-image daily limit no
+# longer applies. Override with the BANNER_IMAGE_MODEL env var, e.g.:
+#   • gemini/imagen-4.0-generate-001   (Google AI Studio, GEMINI_API_KEY)
+#   • vertex_ai/imagen-4.0-generate-001 (Vertex AI credentials)
+#
+# NOTE: Imagen is TEXT-TO-IMAGE ONLY — it cannot accept input images,
+# so photo insertion by the model is impossible. Python composites the
+# real photos, names, and logo assets instead (see flow below), which
+# also guarantees the faces are the untouched uploads.
+# =====================================================================
+BANNER_IMAGE_MODEL = os.getenv("BANNER_IMAGE_MODEL", "gemini/imagen-4.0-generate-001")
+
+# Imagen supported aspect ratios: 1:1, 3:4, 4:3, 9:16, 16:9
+IMAGEN_ASPECT_MAP = {
+    "16:9": "16:9",
+    "1:1": "1:1",
+    "9:16": "9:16",
+    "4:5": "3:4",  # closest supported portrait; Python crops to exact 4:5
+}
+
+# Logo paths (standard format - pasted by Python onto every banner)
+ZENSAR_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "zensar_logo.png")
+ONERPG_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "onerpg_logo.png")
+
+
+# Template styles (for reference/fallback accent colors)
+TEMPLATE_STYLES = {
+    "employee-recognition": {
+        "accent": (255, 201, 71),
+        "tag": "EMPLOYEE RECOGNITION",
+    },
+    "star-performer": {
+        "accent": (253, 186, 116),
+        "tag": "STAR PERFORMER",
+    },
+    "team-achievement": {
+        "accent": (134, 239, 172),
+        "tag": "TEAM ACHIEVEMENT",
+    },
+    "sales-excellence": {
+        "accent": (192, 132, 252),
+        "tag": "SALES EXCELLENCE",
+    },
+}
+
+# Sales-specific template layouts for prompt guidance
+SALES_TEMPLATE_LAYOUTS = {
+    "corporate-achievement": {
+        "layout": "structured-corporate",
+        "description": "structured corporate design celebrating milestones and company success",
+        "visual_style": "corporate-professional",
+    },
+    "employee-recognition": {
+        "layout": "centered-portrait-stack",
+        "description": "professional centered design with an elegant, celebratory feel",
+        "visual_style": "corporate-elegant",
+    },
+    "sales-champion": {
+        "layout": "dynamic-spotlight",
+        "description": "dynamic composition conveying sales excellence and winning energy",
+        "visual_style": "bold-energetic",
+    },
+    "leadership-award": {
+        "layout": "premium-symmetric",
+        "description": "symmetric premium design exuding leadership and authority",
+        "visual_style": "premium-formal",
+    },
+    "milestone-celebration": {
+        "layout": "celebratory-burst",
+        "description": "celebratory composition with festive energy",
+        "visual_style": "vibrant-celebratory",
+    },
+    "star-performer": {
+        "layout": "spotlight-hero",
+        "description": "dramatic spotlight design for star performers",
+        "visual_style": "premium-dramatic",
+    },
+}
+
+# Preset background styles, chosen via dropdown in the UI
+BACKGROUND_STYLE_PRESETS = {
+    "corporate-blue-gradient": (
+        "a clean corporate gradient moving through deep navy to bright blue, "
+        "with subtle geometric line accents, professional and trustworthy"
+    ),
+    "premium-gold-navy": (
+        "a premium formal backdrop combining navy blue with elegant gold accent "
+        "lines and soft light rays, evoking prestige and leadership"
+    ),
+    "vibrant-celebration": (
+        "an energetic celebration backdrop with dynamic light bursts, confetti-like "
+        "accents, and a vibrant multi-color gradient conveying excitement"
+    ),
+    "minimal-professional-white": (
+        "a minimal airy background in white and light gray with soft shadows and "
+        "understated geometric accents, clean and modern"
+    ),
+    "dark-premium-elegance": (
+        "a dark moody premium background in charcoal and black with subtle metallic "
+        "gold highlights and soft spotlight glow"
+    ),
+    "fresh-green-energy": (
+        "a fresh energetic gradient background in green tones with light dynamic "
+        "streaks, suggesting growth, teamwork, and momentum"
+    ),
+}
+
+DEFAULT_BACKGROUND_STYLE = "corporate-blue-gradient"
+
+ASPECT_CANVAS_DIMENSIONS = {
+    "16:9": (1600, 900),
+    "1:1": (900, 900),
+    "4:5": (720, 900),
+    "9:16": (900, 1600),
+}
+
+# Layout band for the photo cards (top area holds title/description)
+BAND_TOP = 0.36
+BAND_BOTTOM = 0.90
+SIDE_MARGIN = 0.06
+
+
+# =====================================================================
+# GENERATION FLOW
+# =====================================================================
+# 1. Imagen generates the designed background: background style, theme
+#    mood, and the title + description rendered in the top area, with
+#    the lower two-thirds kept clean.
+# 2. Python fits the result to the exact canvas size, pastes the REAL
+#    Zensar/OneRPG logo files from assets, pastes every ORIGINAL photo
+#    as a finished card (aligned per aspect ratio), and renders each
+#    name + achievement with adaptive, legible typography.
+# Faces are guaranteed: the model never receives or outputs a person.
+# =====================================================================
+
+
+def _decode_employee_photo(photo_data: str) -> Tuple[bytes, str]:
+    """
+    Decode a base64 / data-URL employee photo into (raw_bytes, mime_type).
+    Validates that the bytes are a real image by opening them with PIL.
+    Raises ValueError if the photo cannot be decoded.
+    """
+    mime = "image/jpeg"
+    encoded = photo_data
+
+    if photo_data.strip().lower().startswith("data:") and "," in photo_data:
+        header, encoded = photo_data.split(",", 1)
+        match = re.match(r"data:([^;]+);", header)
+        if match:
+            mime = match.group(1).strip().lower()
+
+    raw = base64.b64decode(encoded)
+
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    elif raw[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+
+    with Image.open(io.BytesIO(raw)) as probe:
+        probe.verify()
+
+    return raw, mime
+
+
+def _load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    path = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    )
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _wrap_lines(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    max_lines: int,
+) -> List[str]:
+    """Greedy word-wrap; ellipsizes the last line if the text doesn't fit."""
+    words = text.split()
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if draw.textlength(candidate, font=font) <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) == max_lines:
+                break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+
+    used = sum(len(l.split()) for l in lines)
+    if used < len(words) and lines:
+        last = lines[-1]
+        while last and draw.textlength(last + "…", font=font) > max_width:
+            last = last[:-1].rstrip()
+        lines[-1] = (last + "…") if last else "…"
+    return lines
+
+
+def _region_is_light(image: Image.Image, box: Tuple[int, int, int, int]) -> bool:
+    """Mean luminance of a region — decides dark-on-light vs light-on-dark text."""
+    x0, y0, x1, y1 = box
+    x0 = max(0, min(x0, image.width - 1))
+    y0 = max(0, min(y0, image.height - 1))
+    x1 = max(x0 + 1, min(x1, image.width))
+    y1 = max(y0 + 1, min(y1, image.height))
+    region = image.crop((x0, y0, x1, y1)).convert("L")
+    return ImageStat.Stat(region).mean[0] > 150
+
+
+def compute_recipient_slots(canvas_w: int, canvas_h: int, count: int) -> List[Dict[str, int]]:
+    """
+    Compute photo + text areas for each recipient from the canvas size,
+    adapting the grid to the orientation:
+      • landscape → single row
+      • square    → row (1-3) or 2x2 grid (4)
+      • portrait  → single column (1) or 2-column grid (2-4)
+    """
+    count = max(1, min(4, count))
+    orientation = (
+        "portrait" if canvas_h > canvas_w * 1.15
+        else "landscape" if canvas_w > canvas_h * 1.15
+        else "square"
+    )
+
+    if orientation == "landscape":
+        columns = count
+    elif orientation == "square":
+        columns = count if count <= 3 else 2
+    else:  # portrait
+        columns = 1 if count == 1 else 2
+    rows = math.ceil(count / columns)
+
+    band_top = BAND_TOP * canvas_h
+    band_height = (BAND_BOTTOM - BAND_TOP) * canvas_h
+    band_left = SIDE_MARGIN * canvas_w
+    band_width = canvas_w - 2 * band_left
+
+    col_gap = 0.030 * canvas_w
+    row_gap = 0.035 * canvas_h
+
+    cell_w = (band_width - col_gap * (columns - 1)) / columns
+    cell_h = (band_height - row_gap * (rows - 1)) / rows
+
+    photo_h = cell_h * 0.62
+    photo_w = min(cell_w * 0.88, photo_h * 0.85)
+
+    slots: List[Dict[str, int]] = []
+    for i in range(count):
+        col = i % columns
+        row = i // columns
+        items_in_row = min(columns, count - row * columns)
+        row_offset = ((columns - items_in_row) * (cell_w + col_gap)) / 2
+
+        cell_x = band_left + row_offset + col * (cell_w + col_gap)
+        cell_y = band_top + row * (cell_h + row_gap)
+
+        photo_x = cell_x + (cell_w - photo_w) / 2
+        photo_y = cell_y
+        text_y = photo_y + photo_h + 0.015 * canvas_h
+
+        slots.append({
+            "index": i,
+            "x": int(round(photo_x)),
+            "y": int(round(photo_y)),
+            "w": int(round(photo_w)),
+            "h": int(round(photo_h)),
+            "text_x": int(round(cell_x)),
+            "text_y": int(round(text_y)),
+            "text_w": int(round(cell_w)),
+            "text_h": int(round(cell_y + cell_h - text_y)),
+        })
+    return slots
+
+
+def _paste_photo_card(banner: Image.Image, photo: Image.Image, slot: Dict[str, int]) -> None:
+    """Paste one ORIGINAL photo as a rounded card with white border + soft shadow."""
+    w, h = slot["w"], slot["h"]
+    fitted = ImageOps.fit(photo.convert("RGB"), (w, h), Image.LANCZOS)
+    radius = max(6, int(min(w, h) * 0.07))
+
+    shadow = Image.new("RGBA", (w + 28, h + 28), (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(shadow)
+    sdraw.rounded_rectangle([14, 16, 14 + w, 16 + h], radius=radius, fill=(0, 0, 0, 95))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(9))
+    banner.alpha_composite(shadow, (slot["x"] - 14, slot["y"] - 14))
+
+    mask = Image.new("L", (w, h), 0)
+    mdraw = ImageDraw.Draw(mask)
+    mdraw.rounded_rectangle([0, 0, w, h], radius=radius, fill=255)
+    photo_rgba = Image.new("RGBA", (w, h))
+    photo_rgba.paste(fitted, (0, 0))
+    photo_rgba.putalpha(mask)
+    banner.alpha_composite(photo_rgba, (slot["x"], slot["y"]))
+
+    border = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    bdraw = ImageDraw.Draw(border)
+    bdraw.rounded_rectangle(
+        [0, 0, w - 1, h - 1], radius=radius, outline=(255, 255, 255, 235), width=4
+    )
+    banner.alpha_composite(border, (slot["x"], slot["y"]))
+
+
+def _draw_text_block(
+    banner: Image.Image,
+    slot: Dict[str, int],
+    name: str,
+    achievement: str,
+    canvas_w: int,
+    canvas_h: int,
+) -> None:
+    """
+    Render the recipient's name + achievement centered under their photo,
+    with color chosen from the background luminance and a soft halo so it
+    stays legible on every background style.
+    """
+    base = min(canvas_w, canvas_h)
+    name_size = max(16, int(base * 0.036))
+    ach_size = max(12, int(base * 0.023))
+    text_w = int(slot["text_w"] * 0.96)
+
+    draw = ImageDraw.Draw(banner)
+
+    name_font = _load_font(name_size, bold=True)
+    while name_size > 12 and draw.textlength(name, font=name_font) > text_w:
+        name_size -= 1
+        name_font = _load_font(name_size, bold=True)
+
+    ach_font = _load_font(ach_size, bold=False)
+    ach_lines = _wrap_lines(draw, achievement, ach_font, text_w, max_lines=2) if achievement else []
+
+    line_gap = int(base * 0.008)
+    name_h = name_size + line_gap
+    ach_line_h = ach_size + max(2, line_gap // 2)
+    total_h = name_h + len(ach_lines) * ach_line_h
+
+    center_x = slot["text_x"] + slot["text_w"] / 2
+    y = slot["text_y"] + max(0, (slot["text_h"] - total_h) // 6)
+
+    light_bg = _region_is_light(
+        banner,
+        (slot["text_x"], slot["text_y"], slot["text_x"] + slot["text_w"],
+         slot["text_y"] + max(1, slot["text_h"])),
+    )
+    if light_bg:
+        name_fill, ach_fill = (15, 23, 42, 255), (51, 65, 85, 255)
+        halo = (255, 255, 255, 110)
+    else:
+        name_fill, ach_fill = (255, 255, 255, 255), (226, 232, 240, 255)
+        halo = (0, 0, 0, 130)
+
+    halo_layer = Image.new("RGBA", banner.size, (0, 0, 0, 0))
+    hdraw = ImageDraw.Draw(halo_layer)
+    hy = y
+    hdraw.text((center_x, hy), name, font=name_font, fill=halo, anchor="ma")
+    hy += name_h
+    for line in ach_lines:
+        hdraw.text((center_x, hy), line, font=ach_font, fill=halo, anchor="ma")
+        hy += ach_line_h
+    halo_layer = halo_layer.filter(ImageFilter.GaussianBlur(3))
+    banner.alpha_composite(halo_layer)
+
+    draw = ImageDraw.Draw(banner)
+    draw.text((center_x, y), name, font=name_font, fill=name_fill, anchor="ma")
+    y += name_h
+    for line in ach_lines:
+        draw.text((center_x, y), line, font=ach_font, fill=ach_fill, anchor="ma")
+        y += ach_line_h
+
+
+def _paste_logos(banner: Image.Image) -> None:
+    """
+    Paste the REAL Zensar (top-right) and OneRPG (bottom-right) logo files
+    from assets — sharper and more accurate than any model-drawn logo.
+    Silently skipped if an asset file is missing.
+    """
+    canvas_w, canvas_h = banner.size
+    margin = int(canvas_w * 0.025)
+    target_w = int(canvas_w * 0.13)
+
+    placements = [
+        (ZENSAR_LOGO_PATH, "top-right"),
+        (ONERPG_LOGO_PATH, "bottom-right"),
+    ]
+    for path, corner in placements:
+        try:
+            if not os.path.exists(path):
+                logging.warning(f"Logo asset missing, skipping: {path}")
+                continue
+            logo = Image.open(path).convert("RGBA")
+            scale = target_w / logo.width
+            logo = logo.resize(
+                (target_w, max(1, int(logo.height * scale))), Image.LANCZOS
+            )
+            x = canvas_w - margin - logo.width
+            y = margin if corner == "top-right" else canvas_h - margin - logo.height
+            banner.alpha_composite(logo, (x, y))
+        except Exception as e:
+            logging.warning(f"Failed to paste logo {path}: {e}")
+
+
+def render_final_banner(
+    background_bytes: bytes,
+    photo_blobs: List[Tuple[bytes, str]],
+    names: List[str],
+    achievements: List[str],
+    canvas_w: int,
+    canvas_h: int,
+) -> bytes:
+    """
+    Fit the generated background to the exact canvas size, then composite
+    the real logos, the ORIGINAL photos as cards, and the name/achievement
+    text for each recipient.
+    """
+    background = Image.open(io.BytesIO(background_bytes)).convert("RGB")
+    banner = ImageOps.fit(background, (canvas_w, canvas_h), Image.LANCZOS).convert("RGBA")
+
+    _paste_logos(banner)
+
+    slots = compute_recipient_slots(canvas_w, canvas_h, len(photo_blobs))
+    for slot in slots:
+        raw, _mime = photo_blobs[slot["index"]]
+        _paste_photo_card(banner, Image.open(io.BytesIO(raw)), slot)
+
+    for slot in slots:
+        idx = slot["index"]
+        name = names[idx].strip() if idx < len(names) else f"Recipient {idx + 1}"
+        achievement = achievements[idx].strip() if idx < len(achievements) else ""
+        _draw_text_block(banner, slot, name, achievement, canvas_w, canvas_h)
+
+    output = io.BytesIO()
+    banner.convert("RGB").save(output, format="PNG")
+    return output.getvalue()
+
+
+def generate_imagen_prompt(
+    title: str,
+    description: str,
+    template_id: str,
+    theme: str,
+    background_style: str,
+    aspect_ratio: str,
+) -> str:
+    """
+    Text-to-image prompt for Imagen: background artwork + title/description
+    in the top area, lower part clean for the photos and names Python adds.
+    """
+    layout_info = SALES_TEMPLATE_LAYOUTS.get(
+        template_id, SALES_TEMPLATE_LAYOUTS["employee-recognition"]
+    )
+    background_description = BACKGROUND_STYLE_PRESETS.get(
+        background_style, BACKGROUND_STYLE_PRESETS[DEFAULT_BACKGROUND_STYLE]
+    )
+
+    prompt = (
+        f"Professional corporate recognition banner background, {aspect_ratio} composition. "
+        f"Background: {background_description}. "
+        f"Theme: {theme}. Mood: {layout_info['description']} ({layout_info['visual_style']}). "
+        f"In the top area of the canvas, render the large bold title text \"{title}\" centered, "
+        f"and directly beneath it the smaller subtitle text \"{description}\". "
+        f"Both texts spelled exactly as written, crisp and highly legible against the background. "
+        f"The lower two-thirds of the canvas is clean uncluttered ambient background — a smooth "
+        f"continuation of the design with NO text, NO words, NO people, NO faces, NO silhouettes, "
+        f"NO photo frames, NO boxes, and NO logos or brand marks anywhere on the image. "
+        f"Premium polished presentation-ready graphic design, high detail, elegant typography."
+    )
+    return prompt
+
+
+def _parse_retry_delay_seconds(text: str) -> Optional[float]:
+    match = re.search(r"retry in ([0-9.]+)\s*s", text, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    match = re.search(r'"retryDelay"\s*:\s*"([0-9.]+)s"', text)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+async def call_imagen(prompt: str, aspect_ratio: str, attempts: int = 3) -> bytes:
+    """
+    Call Google Imagen via LiteLLM's image generation endpoint with
+    rate-limit-aware retries and clear, friendly errors.
+    """
+    aspect_param = IMAGEN_ASPECT_MAP.get(aspect_ratio, "16:9")
+    supports_aspect_param = True
+    last_error = "Image generation failed"
+
+    print("\n" + "=" * 70)
+    print(f"🎨 IMAGEN GENERATION — model: {BANNER_IMAGE_MODEL}")
+    print("=" * 70)
+    print(f"📝 Prompt length: {len(prompt)} characters | aspect: {aspect_param}")
+    print("=" * 70 + "\n")
+
+    for attempt in range(1, attempts + 1):
+        try:
+            kwargs = {"model": BANNER_IMAGE_MODEL, "prompt": prompt, "n": 1}
+            if supports_aspect_param:
+                kwargs["aspect_ratio"] = aspect_param
+
+            response = await aimage_generation(**kwargs)
+
+            item = response.data[0] if getattr(response, "data", None) else None
+            b64 = None
+            if item is not None:
+                b64 = getattr(item, "b64_json", None)
+                if b64 is None and isinstance(item, dict):
+                    b64 = item.get("b64_json")
+            if b64:
+                if attempt > 1:
+                    print(f"✅ Imagen succeeded on retry {attempt}/{attempts}")
+                return base64.b64decode(b64)
+
+            last_error = "Imagen returned no image data"
+            logging.warning(f"Imagen attempt {attempt}/{attempts}: empty response")
+
+        except TypeError as exc:
+            # Older litellm versions may not accept aspect_ratio — drop it once
+            if supports_aspect_param and "aspect_ratio" in str(exc):
+                supports_aspect_param = False
+                logging.warning("litellm rejected aspect_ratio param; retrying without it")
+                continue
+            last_error = str(exc)
+            logging.warning(f"Imagen attempt {attempt}/{attempts} raised: {exc}")
+
+        except Exception as exc:
+            text = str(exc)
+            last_error = text
+            lower = text.lower()
+
+            # SSL / certificate problems — retrying never helps, surface the fix
+            if "certificate" in lower or "sslerror" in lower or "ssl:" in lower:
+                raise ValueError(
+                    "SSL certificate error while calling the Google image model. "
+                    "Fix: run `uv add python-certifi-win32` in the batch service "
+                    "environment, then restart the service."
+                )
+
+            # Rate limit / quota — wait the delay Google asks for, then retry
+            if ("429" in text or "ratelimiterror" in lower
+                    or "resource_exhausted" in lower or "quota" in lower):
+                if attempt < attempts:
+                    delay = _parse_retry_delay_seconds(text) or 20.0
+                    delay = min(delay + 1.0, 45.0)
+                    print(f"⏳ Rate limited — waiting {delay:.0f}s before retry "
+                          f"{attempt + 1}/{attempts}...")
+                    await asyncio.sleep(delay)
+                continue
+
+            logging.warning(f"Imagen attempt {attempt}/{attempts} raised: {exc}")
+            if attempt < attempts:
+                await asyncio.sleep(2 * attempt)
+
+    lower = last_error.lower()
+    if "429" in last_error or "quota" in lower or "resource_exhausted" in lower:
+        raise ValueError(
+            "The Google image model's usage quota / rate limit was reached. "
+            "Please wait a minute and try again. If it keeps happening, the "
+            "project's daily quota for this model may be used up."
+        )
+    raise ValueError(f"Image generation failed: {last_error[:220]} "
+                     f"(after {attempts} attempts — please try again)")
+
+
+async def sales_banner_generate_handler(request: Request, db: AsyncSession):
+    """
+    Banner generation handler — Google Imagen flow.
+
+      1. Imagen generates the designed background with the title and
+         description rendered in the top area (text-to-image; Imagen
+         accepts no input images).
+      2. Python fits it to the exact aspect ratio, pastes the real logo
+         assets, the ORIGINAL photos as aligned cards, and each name +
+         achievement with adaptive legible typography.
+    """
+    try:
+        payload = await request.json()
+
+        # Extract and validate ALL inputs
+        title = (payload.get("title") or "").strip()
+        description = (payload.get("description") or payload.get("subtitle") or "").strip()
+        template = payload.get("template") or payload.get("template_id") or "employee-recognition"
+        theme = (payload.get("theme") or "Professional Recognition").strip()
+        aspect_ratio = payload.get("aspect_ratio", "16:9")
+        background_style = payload.get("background_style") or DEFAULT_BACKGROUND_STYLE
+        if background_style not in BACKGROUND_STYLE_PRESETS:
+            background_style = DEFAULT_BACKGROUND_STYLE
+
+        # Employee information
+        employees_list = payload.get("employees", [])
+        number_of_employees = payload.get("number_of_employees", 0)
+
+        names = []
+        images = []
+        achievements = []
+
+        if employees_list and number_of_employees > 0:
+            for emp in employees_list[:number_of_employees]:
+                names.append(emp.get("name", "").strip() or "")
+                images.append(emp.get("photo", ""))
+                achievements.append(emp.get("achievement", "").strip() or "")
+        else:
+            # Fallback to legacy format
+            names = [n.strip() if isinstance(n, str) else "" for n in (payload.get("names") or [])]
+            images = payload.get("images") or []
+            achievements = [a.strip() if isinstance(a, str) else "" for a in (payload.get("achievements") or [])]
+
+        # VALIDATION
+        if not title:
+            return JSONResponse({"success": False, "error": "Banner title is required."}, status_code=400)
+        if not description:
+            return JSONResponse({"success": False, "error": "Banner description is required."}, status_code=400)
+
+        if not names or not images or len(names) == 0 or len(images) == 0:
+            return JSONResponse({
+                "success": False,
+                "error": "At least one employee name and photo is required."
+            }, status_code=400)
+
+        if len(images) > 4:
+            return JSONResponse({
+                "success": False,
+                "error": "Maximum 4 employee photos allowed."
+            }, status_code=400)
+
+        for idx in range(len(names)):
+            if not names[idx].strip():
+                return JSONResponse({
+                    "success": False,
+                    "error": f"Recipient {idx + 1} name is required."
+                }, status_code=400)
+            if idx >= len(images) or not images[idx]:
+                return JSONResponse({
+                    "success": False,
+                    "error": f"Recipient {idx + 1} photo is required."
+                }, status_code=400)
+
+        # Log the complete API payload
+        print("\n" + "=" * 70)
+        print("📋 SALES BANNER API PAYLOAD (ALL INPUTS)")
+        print("=" * 70)
+        print(f"Title: {title}")
+        print(f"Description: {description[:80]}...")
+        print(f"Theme: {theme}")
+        print(f"Template: {template}")
+        print(f"Background Style: {background_style}")
+        print(f"Aspect Ratio: {aspect_ratio}")
+        print(f"Employees: {len(names)} ({', '.join(names[:4])})")
+        print(f"Achievements: {len(achievements)}")
+        print(f"Image model: {BANNER_IMAGE_MODEL}")
+        print("=" * 70 + "\n")
+
+        # Create working directory
+        transaction_uuid = str(uuid.uuid4())
+        uuid_path = os.path.join(hls_uploads_path, transaction_uuid)
+        output_folder = os.path.join(uuid_path, "output_folder")
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Decode ALL employee photos (these exact bytes end up on the banner)
+        photo_blobs: List[Tuple[bytes, str]] = []
+        for idx, photo_data in enumerate(images[:4]):
+            try:
+                raw, mime = _decode_employee_photo(photo_data)
+                photo_blobs.append((raw, mime))
+                print(f"✅ Employee photo {idx + 1} ({names[idx]}): {len(raw)} bytes ({mime})")
+            except Exception as e:
+                logging.exception(f"Failed to process employee photo {idx + 1}: {e}")
+                return JSONResponse({
+                    "success": False,
+                    "error": f"Recipient {idx + 1} photo could not be read. Please re-upload it."
+                }, status_code=400)
+
+        if not photo_blobs:
+            return JSONResponse({
+                "success": False,
+                "error": "Failed to process employee photos. Please try again."
+            }, status_code=400)
+
+        canvas_w, canvas_h = ASPECT_CANVAS_DIMENSIONS.get(
+            aspect_ratio, ASPECT_CANVAS_DIMENSIONS["16:9"]
+        )
+
+        # 1) Imagen: background + title + description
+        prompt = generate_imagen_prompt(
+            title=title,
+            description=description,
+            template_id=template,
+            theme=theme,
+            background_style=background_style,
+            aspect_ratio=aspect_ratio,
+        )
+        background_bytes = await call_imagen(prompt=prompt, aspect_ratio=aspect_ratio)
+        print(f"✅ Background generated: {len(background_bytes)} bytes\n")
+
+        # 2) Python: logos + original photos + names/achievements
+        print("🖼️  Compositing logos, original photos, and names...\n")
+        banner_image_bytes = render_final_banner(
+            background_bytes=background_bytes,
+            photo_blobs=photo_blobs,
+            names=names[:4],
+            achievements=achievements[:4],
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
+        )
+
+        if not banner_image_bytes:
+            raise ValueError("Failed to finalize the banner")
+
+        # Save generated banner
+        ratio_tag = aspect_ratio.replace(':', 'x')
+        base_filename = f"sales_banner_{template}_{ratio_tag}"
+
+        counter = 1
+        file_name = f"{base_filename}.png"
+        file_path = os.path.join(output_folder, file_name)
+
+        while os.path.exists(file_path):
+            counter += 1
+            file_name = f"{base_filename}_{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
+
+        with open(file_path, 'wb') as f:
+            f.write(banner_image_bytes)
+
+        print(f"\n✅ Complete banner saved: {file_path}")
+        print(f"   File size: {len(banner_image_bytes)} bytes\n")
+
+        # Return as base64 JSON
+        encoded = base64.b64encode(banner_image_bytes).decode("utf-8")
+
+        return JSONResponse({
+            "success": True,
+            "filename": f"{re.sub(r'[^a-zA-Z0-9]+', '_', title).strip('_').lower() or 'sales_banner'}.png",
+            "image_base64": encoded,
+            "mime_type": "image/png",
+            "template": template,
+            "download_url": None,
+        }, status_code=200)
+
+    except ValueError as ve:
+        logging.exception(f"Validation error: {ve}")
+        return JSONResponse({
+            "success": False,
+            "error": str(ve)
+        }, status_code=400)
+
+    except Exception as exc:
+        logging.exception(f"Banner generation failed: {exc}")
+        return JSONResponse({
+            "success": False,
+            "error": f"Banner generation failed: {str(exc)}"
+        }, status_code=500)
  
