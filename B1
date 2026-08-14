@@ -1,3 +1,13 @@
+cd C:\Users\ST127673\Banner_Generator\backend
+.venv\Scripts\activate
+pip install python-dotenv
+
+uvicorn main:app --reload --port 8000
+
+
+
+
+
 """Configuration. Everything model-related is env-overridable on purpose:
 Google renames image models often, so nothing is hard-coded in the pipeline."""
 
