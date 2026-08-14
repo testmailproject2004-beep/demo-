@@ -1,1 +1,891 @@
+"""Sales Banner editor — business logic only.
+
+This module does NOT define any FastAPI routes or router of its own. Your
+`sales_content_factory_routes.py` already imports a named function —
+`sales_banner_generate_handler` — directly, which means the routing layer
+(path, method, request/response models, auth) lives there, and this file is
+just the logic that function calls into. That split is preserved here.
+
+>>> ASSUMPTION THAT STILL NEEDS YOUR CONFIRMATION <<<
+I don't have `sales_content_factory_routes.py`, so I don't know the exact
+shape of the call `sales_banner_generate_handler` is invoked with — is it
+awaited with a Pydantic model, a raw dict, a FastAPI Request? I've written
+it as an `async def` taking a `SalesBannerGenerateRequest` Pydantic model
+and returning a plain dict, which is the most common pattern for this kind
+of router → handler split. Paste the ~10-20 lines around the banner route
+in that file and I'll align this exactly — guessing the framework wrong
+once already cost you a broken boot, I'd rather not guess the call
+signature wrong too.
+
+Edits from the previous (Flask) version, beyond the framework swap:
+  - Uses `client.aio.models.generate_content` (the async Gemini client),
+    not the sync one. A sync network call inside an `async def` handler
+    would block FastAPI's whole event loop for the duration of every
+    generation — a real correctness bug under concurrent load, not just a
+    style preference.
+  - Errors are raised as `fastapi.HTTPException`, the idiomatic way for a
+    handler to signal a status code + message up to the framework, instead
+    of Flask's `jsonify(...), status_code` tuples.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from fastapi import HTTPException
+from pydantic import BaseModel
+
+# ---------------------------------------------------------------------------
+# Paths and config
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = BASE_DIR / "assets" / "Templates"
+THUMB_CACHE_DIR = TEMPLATES_DIR / ".thumbcache"
+OUTPUT_DIR = BASE_DIR / "assets" / "Generated"
+
+for _d in (TEMPLATES_DIR, THUMB_CACHE_DIR, OUTPUT_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+IMAGE_MODEL = os.getenv("SALES_BANNER_IMAGE_MODEL", "gemini-3.1-flash-image")
+
+
+# ---------------------------------------------------------------------------
+# Request schema
+# ---------------------------------------------------------------------------
+# If you already have a shared Pydantic schema for this request elsewhere
+# in the codebase, use that one instead and adjust the handler's parameter
+# type below — this is a reasonable standalone default, not something that
+# has to live here.
+
+
+class SalesBannerGenerateRequest(BaseModel):
+    template_id: str
+    title: str = ""
+    description: str = ""
+    prompt: str = ""
+    aspect_ratio: str = "16:9"
+    photo: Optional[str] = None  # data URL or raw base64, or None to keep the template's photo
+
+
+# ---------------------------------------------------------------------------
+# Template discovery
+# ---------------------------------------------------------------------------
+#
+# Note: the frontend no longer calls a template-listing endpoint — its
+# picker bundles the 11 images directly from its own assets folder for
+# instant rendering. These functions are kept here as plain callables in
+# case something else (an admin tool, another client) wants server-side
+# template metadata; wire them into a route only if/when something needs
+# them. The one thing that must match between the frontend's bundled
+# images and this folder is the filename stem (template-6.jpg here can be
+# template-6.png on the frontend — extension doesn't need to match, the id
+# does).
+
+
+def _load_overrides() -> dict:
+    path = TEMPLATES_DIR / "templates.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _prettify(stem: str) -> str:
+    name = re.sub(r"[_\-]+", " ", stem).strip()
+    if re.fullmatch(r"[0-9a-f-]{8,}", name.replace(" ", "").lower()) or name.isdigit():
+        return "Untitled template"
+    return name.title()
+
+
+def _mime_for(path: Path) -> str:
+    return {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+    }.get(path.suffix.lower().lstrip("."), "image/png")
+
+
+def discover_templates() -> list[dict]:
+    overrides = _load_overrides()
+    templates = []
+    for path in TEMPLATES_DIR.iterdir():
+        if path.suffix.lower() not in ALLOWED_EXT:
+            continue
+        override = overrides.get(path.stem, {})
+        try:
+            from PIL import Image
+
+            with Image.open(path) as img:
+                width, height = img.size
+        except Exception:
+            width, height = (1, 1)
+
+        aspect = width / height if height else 1.0
+        common = {"16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "4:5": 4 / 5, "9:16": 9 / 16}
+        nearest = min(common, key=lambda k: abs(common[k] - aspect))
+
+        templates.append(
+            {
+                "id": path.stem,
+                "name": override.get("name") or _prettify(path.stem),
+                "order": override.get("order", 999),
+                "width": width,
+                "height": height,
+                "native_aspect_ratio": nearest,
+            }
+        )
+
+    templates.sort(key=lambda t: (t["order"], t["name"]))
+    return templates
+
+
+def _find_template_file(template_id: str) -> Optional[Path]:
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", template_id):
+        return None
+    for ext in ALLOWED_EXT:
+        candidate = TEMPLATES_DIR / f"{template_id}{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Gemini editing
+# ---------------------------------------------------------------------------
+
+
+def _client():
+    if not GEMINI_API_KEY:
+        return None
+    from google import genai
+
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
+def _decode_data_url(value: str) -> bytes:
+    if value.strip().startswith("data:") and "," in value[:80]:
+        value = value.split(",", 1)[1]
+    return base64.b64decode(value)
+
+
+def _build_prompt(title: str, description: str, custom_prompt: str, has_photo: bool) -> str:
+    parts = [
+        "You are editing an existing marketing banner image, not creating a "
+        "new one. Preserve the banner's exact layout, background, "
+        "decorative shapes, colour palette, logo, and the logo's position "
+        "pixel-for-pixel. Do not redesign, restyle, or move anything that "
+        "is not explicitly called out below."
+    ]
+    if title:
+        parts.append(f'Replace the main headline text with: "{title}".')
+    if description:
+        parts.append(f'Replace the supporting body text with: "{description}".')
+    if has_photo:
+        parts.append(
+            "Replace the person currently shown in the banner with the "
+            "person in the second supplied image. Match the original "
+            "person's pose, framing, crop, and lighting as closely as "
+            "possible so the new person sits naturally in the same spot — "
+            "do not change where the person is positioned in the frame."
+        )
+    else:
+        parts.append("Keep the existing person in the banner exactly as they are.")
+    if custom_prompt:
+        parts.append(f"Additional instruction from the user: {custom_prompt.strip()}")
+    parts.append(
+        "Keep all text sharp, correctly spelled, and legible. Do not add "
+        "any new logos, watermarks, or text that wasn't requested."
+    )
+    return " ".join(parts)
+
+
+def _extract_image(response) -> Optional[bytes]:
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                data = inline.data
+                return data if isinstance(data, bytes) else base64.b64decode(data)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The handler your router imports
+# ---------------------------------------------------------------------------
+
+
+async def sales_banner_generate_handler(payload: SalesBannerGenerateRequest) -> dict:
+    """Edit a template with new copy and/or a new person.
+
+    Raises HTTPException on any failure — let FastAPI's normal error
+    handling surface it, rather than encoding success/failure in the
+    return value the way the Flask version did.
+    """
+    template_id = payload.template_id.strip()
+    title = payload.title.strip()
+    description = payload.description.strip()
+    custom_prompt = payload.prompt.strip()
+    aspect_ratio = payload.aspect_ratio.strip()
+
+    if not template_id:
+        raise HTTPException(status_code=400, detail="Select a template first.")
+    if not title and not description and not custom_prompt:
+        raise HTTPException(
+            status_code=400, detail="Add a title, description, or instruction."
+        )
+
+    template_path = _find_template_file(template_id)
+    if template_path is None:
+        raise HTTPException(status_code=404, detail=f"Unknown template '{template_id}'.")
+
+    client = _client()
+    if client is None:
+        raise HTTPException(
+            status_code=502, detail="GEMINI_API_KEY is not configured on the server."
+        )
+
+    from google.genai import types
+
+    parts: list = [
+        types.Part.from_bytes(
+            data=template_path.read_bytes(), mime_type=_mime_for(template_path)
+        )
+    ]
+
+    if payload.photo:
+        try:
+            photo_bytes = _decode_data_url(payload.photo)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail="Could not read the uploaded photo."
+            ) from exc
+        parts.append(types.Part.from_bytes(data=photo_bytes, mime_type="image/png"))
+
+    parts.append(
+        _build_prompt(title, description, custom_prompt, has_photo=bool(payload.photo))
+    )
+
+    config_kwargs: dict = {"response_modalities": ["TEXT", "IMAGE"]}
+    try:
+        config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio or "16:9")
+    except AttributeError:
+        pass  # older/newer SDK without ImageConfig — edit still runs, just without the hint
+
+    try:
+        # .aio — the async client. A sync call here would block the whole
+        # FastAPI event loop for every other in-flight request while this
+        # one waits on the model.
+        response = await client.aio.models.generate_content(
+            model=IMAGE_MODEL,
+            contents=parts,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Image model call failed: {exc}") from exc
+
+    image_bytes = _extract_image(response)
+    if not image_bytes:
+        raise HTTPException(
+            status_code=502,
+            detail="The model did not return an image. Try again, or simplify the instruction.",
+        )
+
+    banner_id = uuid.uuid4().hex[:12]
+    (OUTPUT_DIR / f"{banner_id}.png").write_bytes(image_bytes)
+
+    return {
+        "success": True,
+        "banner_id": banner_id,
+        "template_id": template_id,
+        "image_base64": f"data:image/png;base64,{base64.b64encode(image_bytes).decode()}",
+    }
+
+
+
+
+
+
+
+
+
+
+import { useEffect, useMemo, useState } from 'react';
+import {
+  AlertCircle,
+  Check,
+  Download,
+  ImagePlus,
+  Loader,
+  Sparkles,
+  Wand2,
+  X,
+} from 'lucide-react';
+import { middleware_url } from '../../utils/constants';
+
+// ---------------------------------------------------------------------------
+// Template library
+// ---------------------------------------------------------------------------
+//
+// These are bundled directly into the frontend build from
+// src/hls_src/assets/Templates/ — the picker renders instantly with no
+// network round-trip, and works even if the backend is briefly unavailable.
+//
+// IMPORTANT: the backend (batch_process/.../hls_platform/assets/Templates)
+// keeps its own copy of the same 11 images, used for the actual edit. The
+// `id` below must match that file's basename exactly (extension can
+// differ — the backend searches .jpg/.jpeg/.png/.webp for a given id).
+// Add a 12th template by dropping the file in both folders and adding one
+// line below.
+//
+// Names are placeholders ("Template N") since they weren't visible clearly
+// enough to assign real names automatically — rename each to match what it
+// actually is, this is the one place to edit.
+
+import template1 from '../assets/Templates/template-1.jpg';
+import template2 from '../assets/Templates/template-2.jpg';
+import template3 from '../assets/Templates/template-3.jpg';
+import template4 from '../assets/Templates/template-4.jpg';
+import template5 from '../assets/Templates/template-5.jpg';
+import template6 from '../assets/Templates/template-6.jpg';
+import template7 from '../assets/Templates/template-7.jpg';
+import template8 from '../assets/Templates/template-8.webp';
+import template9 from '../assets/Templates/template-9.webp';
+import template10 from '../assets/Templates/template-10.png';
+import template11 from '../assets/Templates/template-11.png';
+
+interface BannerTemplate {
+  id: string;
+  name: string;
+  image: string;
+}
+
+const TEMPLATE_LIBRARY: BannerTemplate[] = [
+  { id: 'template-1', name: 'Template 1', image: template1 },
+  { id: 'template-2', name: 'Template 2', image: template2 },
+  { id: 'template-3', name: 'Template 3', image: template3 },
+  { id: 'template-4', name: 'Template 4', image: template4 },
+  { id: 'template-5', name: 'Template 5', image: template5 },
+  { id: 'template-6', name: 'Template 6', image: template6 },
+  { id: 'template-7', name: 'Template 7', image: template7 },
+  { id: 'template-8', name: 'Template 8', image: template8 },
+  { id: 'template-9', name: 'Template 9', image: template9 },
+  { id: 'template-10', name: 'Template 10', image: template10 },
+  { id: 'template-11', name: 'Template 11', image: template11 },
+];
+
+const COMMON_RATIOS: Record<string, number> = {
+  '16:9': 16 / 9,
+  '4:3': 4 / 3,
+  '1:1': 1,
+  '4:5': 4 / 5,
+  '9:16': 9 / 16,
+};
+
+function nearestAspectRatio(width: number, height: number): string {
+  const actual = width / height;
+  let best = '16:9';
+  let bestDelta = Infinity;
+  for (const [label, ratio] of Object.entries(COMMON_RATIOS)) {
+    const delta = Math.abs(ratio - actual);
+    if (delta < bestDelta) {
+      best = label;
+      bestDelta = delta;
+    }
+  }
+  return best;
+}
+
+const aspectRatioOptions = [
+  { value: '16:9', label: '16:9 · Widescreen' },
+  { value: '1:1', label: '1:1 · Square' },
+  { value: '4:5', label: '4:5 · Portrait' },
+  { value: '9:16', label: '9:16 · Vertical' },
+] as const;
+
+interface HistoryItem {
+  title: string;
+  time: string;
+  image: string;
+}
+
+interface SalesBannerGeneratorProps {
+  /** Called when the modal is dismissed (X, Cancel). Either prop works. */
+  onClose?: () => void;
+  onBack?: () => void;
+  /**
+   * Set to false if you render this inside an existing modal/dialog wrapper,
+   * so it doesn't add a second full-screen overlay of its own.
+   */
+  overlay?: boolean;
+}
+
+const labelClass = 'mb-1 block text-[11px] font-semibold uppercase tracking-wider text-slate-500';
+
+const inputClass =
+  'w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-900 transition focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600';
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.onerror = () => reject(new Error('Failed to read image file'));
+    reader.readAsDataURL(file);
+  });
+}
+
+export function SalesBannerGenerator({ onClose, onBack, overlay = true }: SalesBannerGeneratorProps) {
+  const handleClose = onClose ?? onBack ?? (() => {});
+
+  // Template list is bundled locally (see TEMPLATE_LIBRARY above) — the
+  // picker renders immediately, nothing to fetch or wait on.
+  const templates = TEMPLATE_LIBRARY;
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(
+    templates[0]?.id ?? null,
+  );
+
+  // Core banner fields
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [aspectRatio, setAspectRatio] = useState<string>('16:9');
+  const [aspectTouched, setAspectTouched] = useState(false);
+  const [prompt, setPrompt] = useState('');
+
+  // Optional photo — if left empty, the backend keeps the person already
+  // baked into the template.
+  const [photo, setPhoto] = useState<string | null>(null);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+
+  // UI state
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+
+  // Native aspect ratio per template, probed client-side by loading each
+  // image once. Populates progressively; a template selected before its
+  // probe resolves just keeps the current aspect ratio until it does.
+  const [nativeRatios, setNativeRatios] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    templates.forEach((template) => {
+      const img = new Image();
+      img.onload = () => {
+        if (cancelled) return;
+        const ratio = nearestAspectRatio(img.naturalWidth, img.naturalHeight);
+        setNativeRatios((prev) => ({ ...prev, [template.id]: ratio }));
+      };
+      img.src = template.image;
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const selectedTemplate = useMemo(
+    () => templates.find((t) => t.id === selectedTemplateId) ?? null,
+    [templates, selectedTemplateId],
+  );
+
+  // Once a template's native ratio resolves, adopt it as the default —
+  // unless the user already deliberately picked a different one.
+  useEffect(() => {
+    if (!selectedTemplateId || aspectTouched) return;
+    const ratio = nativeRatios[selectedTemplateId];
+    if (ratio) setAspectRatio(ratio);
+  }, [selectedTemplateId, nativeRatios, aspectTouched]);
+
+  function selectTemplate(template: BannerTemplate) {
+    setSelectedTemplateId(template.id);
+    if (!aspectTouched && nativeRatios[template.id]) {
+      setAspectRatio(nativeRatios[template.id]);
+    }
+  }
+
+  async function handlePhotoUpload(file: File | null) {
+    if (!file) return;
+    if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(file.type)) {
+      setPhotoError('Only PNG, JPG, or WEBP files are supported');
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      setPhotoError('Image size must be under 10MB');
+      return;
+    }
+    try {
+      setPhoto(await readFileAsDataUrl(file));
+      setPhotoError(null);
+    } catch {
+      setPhotoError('Failed to read image file');
+    }
+  }
+
+  async function generateBanner() {
+    if (!selectedTemplateId) {
+      setError('Pick a template first');
+      return;
+    }
+    if (!title.trim() && !description.trim() && !prompt.trim()) {
+      setError('Add a title, description, or instruction so there is something to change');
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const token = localStorage.getItem('token');
+      const payload = {
+        template_id: selectedTemplateId,
+        title: title.trim(),
+        description: description.trim(),
+        prompt: prompt.trim(),
+        aspect_ratio: aspectRatio,
+        photo, // null keeps the person already in the template
+      };
+
+      const response = await fetch(
+        `${middleware_url}/batch_process/sales_platform/banner/generate`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(payload),
+        },
+      );
+
+      const data = await response.json();
+      const isSuccess = data.success ?? data.status === 'success';
+      if (!response.ok || !isSuccess) {
+        throw new Error(data.detail || data.error || data.message || 'Banner generation failed');
+      }
+
+      const imageData = data.image_base64 || data.banner?.image_base64 || data.preview_url;
+      if (!imageData) throw new Error('No banner image returned by the server');
+
+      const bannerImage = imageData.startsWith('data:image')
+        ? imageData
+        : `data:image/png;base64,${imageData}`;
+      setPreviewUrl(bannerImage);
+
+      setHistory((prev) =>
+        [
+          {
+            title: title.trim() || selectedTemplate?.name || 'Banner',
+            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            image: bannerImage,
+          },
+          ...prev,
+        ].slice(0, 6),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to generate banner');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function downloadBanner() {
+    if (!previewUrl) return;
+    const link = document.createElement('a');
+    link.href = previewUrl;
+    link.download = `sales-banner-${Date.now()}.png`;
+    link.click();
+  }
+
+  const card = (
+    <div className="flex max-h-[94vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl bg-white text-sm text-slate-900 antialiased shadow-2xl">
+      {/* ===== Header ===== */}
+      <div className="flex items-center justify-between px-5 py-3">
+        <div>
+          <div className="text-lg font-bold leading-tight text-slate-900">Banner Generator</div>
+          <div className="mt-0.5 text-xs leading-tight text-slate-500">
+            Edits one of the approved templates — layout and logo stay locked
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={handleClose}
+          aria-label="Close"
+          className="rounded-md p-1 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+        >
+          <X size={18} />
+        </button>
+      </div>
+      <div className="border-b border-blue-100" />
+
+      {/* ===== Scrollable body ===== */}
+      <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
+        {/* Template picker */}
+        <section>
+          <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">
+            Choose a template
+          </div>
+
+          <div className="grid grid-cols-3 gap-2.5 sm:grid-cols-4">
+            {templates.map((template) => {
+              const active = template.id === selectedTemplateId;
+              return (
+                <button
+                  key={template.id}
+                  type="button"
+                  onClick={() => selectTemplate(template)}
+                  className={`group relative overflow-hidden rounded-lg border-2 text-left transition ${
+                    active
+                      ? 'border-blue-600 ring-2 ring-blue-100'
+                      : 'border-slate-200 hover:border-blue-300'
+                  }`}
+                >
+                  <img
+                    src={template.image}
+                    alt={template.name}
+                    className="aspect-[4/3] w-full object-cover"
+                    loading="lazy"
+                  />
+                  {active && (
+                    <span className="absolute right-1 top-1 rounded-full bg-blue-600 p-0.5 text-white">
+                      <Check size={11} />
+                    </span>
+                  )}
+                  <span className="block truncate bg-white px-1.5 py-1 text-[10.5px] font-medium text-slate-700">
+                    {template.name}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+        <br />
+
+        {/* Banner content */}
+        <section>
+          <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">
+            Banner content
+          </div>
+          <div className="space-y-3">
+            <div>
+              <label className={labelClass}>Title</label>
+              <input
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="e.g., Q3 Sales Champion"
+                className={inputClass}
+              />
+            </div>
+            <div>
+              <label className={labelClass}>Description</label>
+              <textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="e.g., Congratulations on closing the year with record numbers"
+                className={`${inputClass} min-h-[48px] resize-none`}
+              />
+            </div>
+          </div>
+        </section>
+
+        <br />
+
+        {/* Photo + aspect ratio */}
+        <section>
+          <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">
+            Person &amp; format
+          </div>
+          <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
+            <div>
+              <label className={labelClass}>Photo</label>
+              {photo ? (
+                <div className="flex items-center gap-2.5">
+                  <img
+                    src={photo}
+                    alt="Uploaded"
+                    className="h-11 w-11 rounded-md border border-slate-200 object-cover"
+                  />
+                  <span className="text-xs text-slate-500">Will replace the template's photo</span>
+                  <button
+                    type="button"
+                    onClick={() => setPhoto(null)}
+                    className="ml-auto rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 transition hover:border-red-400 hover:text-red-600"
+                  >
+                    Remove
+                  </button>
+                </div>
+              ) : (
+                <label className="flex cursor-pointer items-center gap-2.5">
+                  <span className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:border-blue-500 hover:text-blue-700">
+                    <ImagePlus size={13} />
+                    Choose file
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="sr-only"
+                    onChange={(e) => void handlePhotoUpload(e.target.files?.[0] || null)}
+                  />
+                </label>
+              )}
+              <p className="mt-1 text-[11px] leading-snug text-slate-500">
+                Optional — leave empty to keep the person already in the template.
+              </p>
+              {photoError && <p className="mt-1 text-[11px] text-red-600">{photoError}</p>}
+            </div>
+
+            <div>
+              <label className={labelClass}>Aspect ratio</label>
+              <div className="relative">
+                <select
+                  value={aspectRatio}
+                  onChange={(e) => {
+                    setAspectRatio(e.target.value);
+                    setAspectTouched(true);
+                  }}
+                  className="w-full cursor-pointer appearance-none rounded-md border border-slate-300 bg-white px-2.5 py-1.5 pr-8 text-sm text-slate-900 transition focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
+                >
+                  {aspectRatioOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {selectedTemplateId && nativeRatios[selectedTemplateId] && (
+                <p className="mt-1 text-[11px] leading-snug text-slate-500">
+                  Template's native ratio is {nativeRatios[selectedTemplateId]}.
+                </p>
+              )}
+            </div>
+          </div>
+        </section>
+
+        <br />
+
+        {/* Prompt */}
+        <section>
+          <div className="mb-2 flex items-center gap-1.5 text-sm font-semibold leading-tight text-slate-900">
+            <Wand2 size={15} className="text-blue-600" />
+            Anything else to change?
+          </div>
+          <textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Optional — e.g., make the confetti more subtle, use a cooler colour tone"
+            className={`${inputClass} min-h-[48px] resize-none`}
+          />
+          <p className="mt-1 text-[11px] leading-snug text-slate-500">
+            Everything else in the template — logo, layout, colours — stays exactly as designed
+            unless you mention it here.
+          </p>
+        </section>
+
+        {/* Preview */}
+        {previewUrl && (
+          <section>
+            <div className="mb-2 flex items-center justify-between">
+              <div className="text-sm font-semibold leading-tight text-slate-900">Preview</div>
+              <button
+                type="button"
+                onClick={downloadBanner}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+              >
+                <Download size={13} />
+                Download PNG
+              </button>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
+              <img
+                src={previewUrl}
+                alt="Generated banner"
+                className="mx-auto max-h-[280px] w-full rounded-md object-contain shadow-sm"
+              />
+            </div>
+
+            {history.length > 0 && (
+              <div className="mt-3">
+                <p className="mb-1.5 text-xs text-slate-600">Recent banners</p>
+                <div className="grid grid-cols-3 gap-2">
+                  {history.map((item, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => setPreviewUrl(item.image)}
+                      className="group relative overflow-hidden rounded-md border border-slate-200 transition hover:border-blue-500"
+                    >
+                      <img src={item.image} alt={item.title} className="h-14 w-full object-cover" />
+                      <div className="absolute inset-0 flex items-end bg-black/0 p-1.5 transition group-hover:bg-black/30">
+                        <span className="truncate text-[10px] font-semibold text-white opacity-0 transition group-hover:opacity-100">
+                          {item.title}
+                        </span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {error && (
+          <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50 p-2.5">
+            <AlertCircle size={15} className="mt-0.5 flex-shrink-0 text-red-600" />
+            <p className="text-xs font-medium text-red-900">{error}</p>
+          </div>
+        )}
+      </div>
+
+      {/* ===== Footer ===== */}
+      <div className="flex items-center justify-between border-t border-slate-200 px-5 py-2.5">
+        <button
+          type="button"
+          onClick={handleClose}
+          className="rounded-md px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={generateBanner}
+          disabled={loading || !selectedTemplateId}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-indigo-500 to-blue-600 px-4 py-2 text-sm font-semibold text-white shadow transition hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {loading ? (
+            <>
+              <Loader size={14} className="animate-spin" />
+              Generating…
+            </>
+          ) : (
+            <>
+              <Sparkles size={14} />
+              Generate Banner
+            </>
+          )}
+        </button>
+      </div>
+    </div>
+  );
+
+  if (!overlay) {
+    return card;
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3">
+      {card}
+    </div>
+  );
+}
 
