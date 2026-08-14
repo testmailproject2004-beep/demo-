@@ -1,40 +1,25 @@
-1:33:52 pm [vite] Internal server error: Failed to resolve import "./components/BannerStage" from "src/App.tsx". Does the file exist?
-  Plugin: vite:import-analysis
-  File: C:/Users/ST127673/Banner_Generator/frontend/src/App.tsx:2:24
-  17 |  var _s = $RefreshSig$();
-  18 |  import { useEffect, useRef, useState } from "react";
-  19 |  import BannerStage from "./components/BannerStage";
-     |                           ^
-  20 |  import ControlDeck from "./components/ControlDeck";
-  21 |  import SpecInspector from "./components/SpecInspector";
-      at TransformPluginContext._formatError (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49258:41)
-      at TransformPluginContext.error (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49253:16)
-      at normalizeUrl (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64307:23)
-      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
-      at async file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64439:39
-      at async Promise.all (index 4)
-      at async TransformPluginContext.transform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64366:7)
-      at async PluginContainer.transform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49099:18)
-      at async loadAndTransform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:51978:27)
-1:33:52 pm [vite] Pre-transform error: Failed to resolve import "./components/BannerStage" from "src/App.tsx". Does the file exist?
-1:33:52 pm [vite] ✨ new dependencies optimized: react-dom/client
-1:33:52 pm [vite] ✨ optimized dependencies changed. reloading
-1:33:53 pm [vite] Internal server error: Failed to resolve import "./components/BannerStage" from "src/App.tsx". Does the file exist?
-  Plugin: vite:import-analysis
-  File: C:/Users/ST127673/Banner_Generator/frontend/src/App.tsx:2:24
-  17 |  var _s = $RefreshSig$();
-  18 |  import { useEffect, useRef, useState } from "react";
-  19 |  import BannerStage from "./components/BannerStage";
-     |                           ^
-  20 |  import ControlDeck from "./components/ControlDeck";
-  21 |  import SpecInspector from "./components/SpecInspector";
-      at TransformPluginContext._formatError (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49258:41)
-      at TransformPluginContext.error (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49253:16)
-      at normalizeUrl (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64307:23)
-      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
-      at async file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64439:39
-      at async Promise.all (index 4)
-      at async TransformPluginContext.transform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64366:7)
-      at async PluginContainer.transform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49099:18)
-      at async loadAndTransform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:51978:27)
-1:33:53 pm [vite] Pre-transform error: Failed to resolve import "./components/BannerStage" from "src/App.tsx". Does the file exist?
+GEMINI_API_KEY=AQ**
+BRAND_NAME=Zensar
+PLANNER_MODEL=gemini-2.5-flash
+IMAGE_MODEL_FAST=gemini-2.5-flash-image
+IMAGE_MODEL_STANDARD=gemini-3.1-flash-image
+IMAGE_MODEL_PRO=gemini-3-pro-image
+ALLOWED_ORIGINS=http://localhost:5173
+
+
+Planner offline — used keyword planning. Set GEMINI_API_KEY.
+Brand asset 'logo-white.png' not found in assets/brand — drew a text mark instead.
+Brand asset 'footer-white.png' not found in assets/brand — drew a text mark instead.
+
+(.venv) PS C:\Users\ST127673\Banner_Generator\backend> uvicorn main:app --reload --port 8000
+INFO:     Will watch for changes in these directories: ['C:\\Users\\ST127673\\Banner_Generator\\backend']
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [22952] using WatchFiles
+INFO:     Started server process [1412]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:65212 - "POST /api/generate HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62238 - "GET /media/965711cdbe9a-banner.png HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62238 - "GET /media/965711cdbe9a-visual.png HTTP/1.1" 200 OK
+
+
