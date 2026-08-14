@@ -1,1 +1,160 @@
+"""Turns a free-text brief into a BannerSpec, then a BannerSpec into an
+image prompt.
+
+Two rules hold everywhere in this module:
+  1. The image model is never asked to render text or logos.
+  2. If the planner is unavailable, we degrade to a keyword plan instead of
+     failing the request.
+"""
+
+import json
+import re
+from typing import Optional
+
+from config import GEMINI_API_KEY, PLANNER_MODEL
+from models import BannerSpec
+from services import templates
+
+PLANNER_SYSTEM = """You plan corporate marketing banners for an enterprise
+technology brand. Read the user's brief and return ONLY a JSON object, with no
+prose and no markdown fences, using exactly these keys:
+
+title, description, cta, template, theme, style, background, subject,
+subject_position, text_position, color_palette, aspect_ratio
+
+Rules:
+- title: max 12 words, sentence case, specific to the brief. No brand name.
+- description: one or two sentences, max 32 words.
+- cta: short action label, or null when the brief implies none.
+- template: one of {templates}.
+- subject_position: left, right, center or none.
+- text_position: left, right or center.
+- aspect_ratio: one of 16:9, 4:3, 1:1, 4:5, 9:16.
+- background: a visual scene description only. Never mention text, logos,
+  captions or lettering.
+"""
+
+
+def _client():
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        from google import genai
+
+        return genai.Client(api_key=GEMINI_API_KEY)
+    except Exception:
+        return None
+
+
+def _extract_json(raw: str) -> dict:
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    return json.loads(match.group(0) if match else raw)
+
+
+def _fallback_spec(brief: str) -> BannerSpec:
+    """Keyword plan used when no API key is set or the planner errors."""
+    text = brief.strip() or "Enterprise technology, engineered for outcomes"
+    first = re.split(r"(?<=[.!?])\s+", text)[0]
+    words = first.split()
+    title = " ".join(words[:11]).rstrip(".,")
+    lowered = text.lower()
+
+    if any(word in lowered for word in ("webinar", "speaker", "session", "panel")):
+        template = "event-speaker"
+    elif any(word in lowered for word in ("minimal", "clean", "simple")):
+        template = "minimal-split"
+    elif any(word in lowered for word in ("launch", "announce", "product")):
+        template = "technology-center"
+    else:
+        template = templates.DEFAULT_TEMPLATE
+
+    layout = templates.get(template)
+    return BannerSpec(
+        title=title or "Quality intelligence",
+        description=text if len(text) < 180 else text[:177] + "...",
+        template=template,
+        text_position=layout["text_position"],
+        subject_position=layout["subject_position"],
+        background="modern corporate technology environment, soft directional light",
+        subject="business professional in business attire",
+    )
+
+
+def plan(brief: str, overrides: Optional[dict] = None) -> tuple[BannerSpec, list[str]]:
+    """Interpret a brief. Returns the spec and any warnings worth surfacing."""
+    warnings: list[str] = []
+    client = _client()
+
+    if client is None:
+        spec = _fallback_spec(brief)
+        warnings.append("Planner offline — used keyword planning. Set GEMINI_API_KEY.")
+    else:
+        prompt = PLANNER_SYSTEM.format(templates=", ".join(templates.TEMPLATES))
+        try:
+            response = client.models.generate_content(
+                model=PLANNER_MODEL,
+                contents=[prompt, f"Brief: {brief}"],
+            )
+            spec = BannerSpec(**_extract_json(response.text))
+        except Exception as exc:  # planner failures must not break rendering
+            spec = _fallback_spec(brief)
+            warnings.append(f"Planner failed ({type(exc).__name__}) — used keyword planning.")
+
+    if overrides:
+        clean = {k: v for k, v in overrides.items() if v not in (None, "")}
+        spec = spec.model_copy(update=clean)
+
+    if spec.template not in templates.TEMPLATES:
+        warnings.append(f"Unknown template '{spec.template}' — fell back to default.")
+        spec.template = templates.DEFAULT_TEMPLATE
+
+    return spec, warnings
+
+
+def visual_prompt(spec: BannerSpec, has_person: bool = False) -> str:
+    """Prompt for the background/subject artwork only — never the banner text."""
+    layout = templates.get(spec.template)
+    keep_clear = {
+        "left": "Keep the left 55% of the frame visually calm and uncluttered.",
+        "right": "Keep the right 55% of the frame visually calm and uncluttered.",
+        "center": "Keep the central band visually calm so type can sit over it.",
+    }[spec.text_position]
+
+    subject_line = ""
+    if spec.subject_position != "none" and spec.subject:
+        side = spec.subject_position
+        subject_line = f"Place {spec.subject} on the {side} of the frame, three-quarter view, looking toward camera. "
+        if has_person:
+            subject_line = (
+                f"Use the supplied portrait as the person. Preserve their face, "
+                f"skin tone and hair exactly. Place them on the {side} of the frame. "
+            )
+
+    return (
+        f"Photographic corporate marketing artwork. {spec.style}. "
+        f"Scene: {spec.background}. "
+        f"{subject_line}"
+        f"Colour palette: {spec.color_palette}. Theme: {spec.theme}. "
+        f"{keep_clear} "
+        f"Composition target: {layout['name']} layout, {spec.aspect_ratio} frame. "
+        f"Sharp focus, even professional lighting, no harsh vignetting. "
+        f"Absolutely no text, letters, words, numbers, logos, watermarks, "
+        f"captions or UI elements anywhere in the image."
+    )
+
+
+def edit_prompt(instruction: str, keep_text: bool = True) -> str:
+    guard = (
+        "Do not add any text, lettering or logos to the image. "
+        if keep_text
+        else ""
+    )
+    return (
+        f"Edit the supplied banner artwork. {instruction}. "
+        f"Preserve the existing composition, subject placement and lighting "
+        f"unless the instruction says otherwise. {guard}"
+        f"Return the edited image only."
+    )
 
