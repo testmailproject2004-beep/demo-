@@ -1,1 +1,35 @@
+import type { Mode } from "../types";
+
+const MODES: { id: Mode; label: string; hint: string }[] = [
+  { id: "create", label: "Create", hint: "Write a brief, get a banner." },
+  { id: "reference", label: "Match a reference", hint: "Reuse a banner's look." },
+  { id: "edit", label: "Edit", hint: "Change one thing about the artwork." },
+];
+
+interface Props {
+  mode: Mode;
+  onChange: (mode: Mode) => void;
+}
+
+export default function ModeTabs({ mode, onChange }: Props) {
+  const active = MODES.find((item) => item.id === mode);
+  return (
+    <div className="modes">
+      <div className="modes__row" role="tablist" aria-label="Generation mode">
+        {MODES.map((item) => (
+          <button
+            key={item.id}
+            role="tab"
+            aria-selected={mode === item.id}
+            className={`modes__tab ${mode === item.id ? "is-active" : ""}`}
+            onClick={() => onChange(item.id)}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+      <p className="modes__hint">{active?.hint}</p>
+    </div>
+  );
+}
 
