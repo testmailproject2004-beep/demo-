@@ -1,1 +1,81 @@
+import { useRef, useState } from "react";
+import { readFile } from "../api";
+import type { Upload } from "../types";
+
+interface Props {
+  label: string;
+  hint: string;
+  value: Upload | null;
+  onChange: (upload: Upload | null) => void;
+}
+
+export default function ImageDrop({ label, hint, value, onChange }: Props) {
+  const input = useRef<HTMLInputElement>(null);
+  const [over, setOver] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function accept(file: File | undefined) {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setError("That file is not an image. Use PNG or JPG.");
+      return;
+    }
+    setError(null);
+    const { base64, preview } = await readFile(file);
+    onChange({ name: file.name, base64, preview });
+  }
+
+  return (
+    <div className="field">
+      <div className="field__head">
+        <label className="field__label">{label}</label>
+        {value && (
+          <button className="field__clear" onClick={() => onChange(null)}>
+            Remove
+          </button>
+        )}
+      </div>
+
+      <div
+        className={`drop ${over ? "is-over" : ""} ${value ? "has-file" : ""}`}
+        onDragOver={(event) => {
+          event.preventDefault();
+          setOver(true);
+        }}
+        onDragLeave={() => setOver(false)}
+        onDrop={(event) => {
+          event.preventDefault();
+          setOver(false);
+          void accept(event.dataTransfer.files[0]);
+        }}
+        onClick={() => input.current?.click()}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") input.current?.click();
+        }}
+        role="button"
+        tabIndex={0}
+      >
+        {value ? (
+          <>
+            <img className="drop__thumb" src={value.preview} alt="" />
+            <span className="drop__name">{value.name}</span>
+          </>
+        ) : (
+          <>
+            <span className="drop__plus">+</span>
+            <span className="drop__hint">{hint}</span>
+          </>
+        )}
+        <input
+          ref={input}
+          type="file"
+          accept="image/*"
+          className="drop__input"
+          onChange={(event) => void accept(event.target.files?.[0])}
+        />
+      </div>
+      {error && <p className="field__error">{error}</p>}
+    </div>
+  );
+}
 
