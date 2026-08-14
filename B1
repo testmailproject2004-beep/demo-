@@ -1,1 +1,63 @@
+import { useState } from "react";
+import type { BannerSpec } from "../types";
+
+interface Props {
+  spec: BannerSpec | null;
+  busy: boolean;
+  onRecompose: (updates: Partial<BannerSpec>) => void;
+}
+
+const FIELDS: (keyof BannerSpec)[] = [
+  "title",
+  "description",
+  "cta",
+  "template",
+  "theme",
+  "background",
+  "subject",
+  "text_position",
+  "subject_position",
+  "color_palette",
+  "aspect_ratio",
+];
+
+export default function SpecInspector({ spec, busy, onRecompose }: Props) {
+  const [open, setOpen] = useState(false);
+
+  if (!spec) return null;
+
+  return (
+    <section className="spec">
+      <button className="spec__head" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span className="spec__eyebrow">Plan</span>
+        <span className="spec__title">
+          {open ? "Hide the plan behind this banner" : "See the plan behind this banner"}
+        </span>
+      </button>
+
+      {open && (
+        <>
+          <dl className="spec__list">
+            {FIELDS.map((key) => (
+              <div className="spec__row" key={String(key)}>
+                <dt>{String(key).replace(/_/g, " ")}</dt>
+                <dd>{String(spec[key] ?? "—")}</dd>
+              </div>
+            ))}
+          </dl>
+          <p className="spec__note">
+            Type and layout re-render without another model call, so fixing a headline is instant.
+          </p>
+          <button
+            className="btn"
+            disabled={busy}
+            onClick={() => onRecompose({ title: spec.title, description: spec.description })}
+          >
+            Re-render text only
+          </button>
+        </>
+      )}
+    </section>
+  );
+}
 
