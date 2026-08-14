@@ -1,1 +1,150 @@
 
+import { useState } from "react";
+import { mediaUrl } from "../api";
+import type { BannerResult } from "../types";
+
+/** Mirrors LOGO_ZONE / FOOTER_ZONE in backend/services/templates.py. */
+const ZONES = [
+  { id: "logo", label: "Logo · locked", rect: [0.735, 0.055, 0.205, 0.085] },
+  { id: "footer", label: "Footer · locked", rect: [0.7, 0.855, 0.24, 0.07] },
+];
+
+interface Props {
+  result: BannerResult | null;
+  busy: boolean;
+  error: string | null;
+  onEdit: (instruction: string) => void;
+  onRegenerate: () => void;
+}
+
+export default function BannerStage({
+  result,
+  busy,
+  error,
+  onEdit,
+  onRegenerate,
+}: Props) {
+  const [showZones, setShowZones] = useState(true);
+  const [instruction, setInstruction] = useState("");
+
+  const ratio = result?.spec.aspect_ratio ?? "16:9";
+  const [w, h] = ratio.split(":").map(Number);
+
+  return (
+    <section className="stage">
+      <div className="stage__bar">
+        <span className="stage__meta">
+          {result ? (
+            <>
+              {result.spec.aspect_ratio} · {result.template} · {result.banner_id}
+            </>
+          ) : (
+            "No banner yet"
+          )}
+        </span>
+        <button
+          className={`stage__zonetoggle ${showZones ? "is-active" : ""}`}
+          onClick={() => setShowZones(!showZones)}
+        >
+          Brand zones
+        </button>
+      </div>
+
+      <div className="stage__floor">
+        <div className="canvas" style={{ aspectRatio: `${w} / ${h}` }}>
+          {result ? (
+            <img className="canvas__img" src={mediaUrl(result.image_url)} alt={result.spec.title} />
+          ) : (
+            <div className="canvas__empty">
+              <p className="canvas__emptytitle">Describe a banner to start</p>
+              <p className="canvas__emptybody">
+                The logo positions are already fixed. You control the message and the picture.
+              </p>
+            </div>
+          )}
+
+          {busy && (
+            <div className="canvas__busy">
+              <span className="canvas__scan" />
+              <span className="canvas__busytext">Composing</span>
+            </div>
+          )}
+
+          {showZones &&
+            ZONES.map((zone) => {
+              const [x, y, zw, zh] = zone.rect;
+              return (
+                <div
+                  key={zone.id}
+                  className="zone"
+                  style={{
+                    left: `${x * 100}%`,
+                    top: `${y * 100}%`,
+                    width: `${zw * 100}%`,
+                    height: `${zh * 100}%`,
+                  }}
+                >
+                  <span className="zone__label">{zone.label}</span>
+                </div>
+              );
+            })}
+        </div>
+
+        {error && <p className="stage__error">{error}</p>}
+
+        {result?.warnings.length ? (
+          <ul className="stage__warnings">
+            {result.warnings.map((warning) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
+        ) : null}
+
+        <div className="stage__actions">
+          <button className="btn" onClick={onRegenerate} disabled={busy || !result}>
+            Regenerate
+          </button>
+          <a
+            className={`btn btn--primary ${result ? "" : "is-disabled"}`}
+            href={result ? mediaUrl(result.image_url) : undefined}
+            download={result ? `zensar-banner-${result.banner_id}.png` : undefined}
+          >
+            Download PNG
+          </a>
+          {result && (
+            <a className="btn btn--ghost" href={mediaUrl(result.visual_url)} target="_blank" rel="noreferrer">
+              View artwork only
+            </a>
+          )}
+        </div>
+
+        {result && (
+          <div className="editbar">
+            <input
+              className="input"
+              placeholder="Change one thing: make the background cooler, move the person further right…"
+              value={instruction}
+              onChange={(event) => setInstruction(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && instruction.trim()) {
+                  onEdit(instruction.trim());
+                  setInstruction("");
+                }
+              }}
+            />
+            <button
+              className="btn"
+              disabled={busy || !instruction.trim()}
+              onClick={() => {
+                onEdit(instruction.trim());
+                setInstruction("");
+              }}
+            >
+              Apply edit
+            </button>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
