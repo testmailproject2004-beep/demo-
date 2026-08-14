@@ -1,3 +1,11 @@
+outputs/*.png
+outputs/*.json
+__pycache__/
+node_modules/
+.env
+dist/
+
+
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
