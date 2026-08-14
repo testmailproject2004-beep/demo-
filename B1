@@ -1,1 +1,87 @@
+import type {
+  BannerResult,
+  BannerSpec,
+  GeneratePayload,
+  Health,
+  TemplateInfo,
+} from "./types";
+
+const BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+
+export const mediaUrl = (path: string): string =>
+  path.startsWith("http") ? path : `${BASE}${path}`;
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${BASE}${path}`, {
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+  if (!response.ok) {
+    let detail = `Request failed with ${response.status}.`;
+    try {
+      const body = await response.json();
+      if (body?.detail) detail = String(body.detail);
+    } catch {
+      /* keep the status-based message */
+    }
+    throw new Error(detail);
+  }
+  return response.json() as Promise<T>;
+}
+
+export const getHealth = () => request<Health>("/api/health");
+
+export const getTemplates = () => request<TemplateInfo[]>("/api/templates");
+
+export const planBrief = (brief: string, overrides: Partial<BannerSpec> = {}) =>
+  request<{ spec: BannerSpec; warnings: string[] }>("/api/plan", {
+    method: "POST",
+    body: JSON.stringify({ brief, overrides, mode: "create", quality: "standard" }),
+  });
+
+export const generateBanner = (payload: GeneratePayload) =>
+  request<BannerResult>("/api/generate", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+export const editBanner = (bannerId: string, instruction: string) =>
+  request<BannerResult>("/api/edit", {
+    method: "POST",
+    body: JSON.stringify({ banner_id: bannerId, instruction, keep_text: true }),
+  });
+
+/** Re-render type and layout over the existing artwork. No model call. */
+export const recomposeBanner = (bannerId: string, updates: Partial<BannerSpec>) =>
+  request<BannerResult>("/api/recompose", {
+    method: "POST",
+    body: JSON.stringify({
+      banner_id: bannerId,
+      instruction: JSON.stringify(updates),
+      keep_text: true,
+    }),
+  });
+
+export async function uploadBrandAsset(slot: string, file: File): Promise<void> {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${BASE}/api/brand-asset?slot=${slot}`, {
+    method: "POST",
+    body: form,
+  });
+  if (!response.ok) throw new Error(`Could not install the ${slot} asset.`);
+}
+
+/** Read a file into the base64 payload the API expects, plus a preview URL. */
+export function readFile(file: File): Promise<{ base64: string; preview: string }> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result);
+      resolve({ base64: result.split(",")[1] ?? "", preview: result });
+    };
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+    reader.readAsDataURL(file);
+  });
+}
 
