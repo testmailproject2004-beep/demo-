@@ -1,1 +1,131 @@
+# Zensar Banner Studio
+
+An AI banner generator where the user controls the message and the picture, and
+the brand stays fixed. Gemini produces the artwork; the backend composes the
+type and drops the Zensar marks into two locked corners on every single banner.
+
+```
+brief ──▶ planner (Gemini text) ──▶ BannerSpec ──▶ image model (Gemini image)
+                                         │                    │
+                                         └────▶ composer (Pillow) ◀── artwork
+                                                     │
+                                          locked logos + type
+                                                     │
+                                                 final PNG
+```
+
+The image model is never asked to draw text or a logo. That is the whole
+design: it is the only way the top-right and bottom-right marks land in the
+same place at the same size on every banner.
+
+## Layout
+
+```
+backend/
+  main.py                    FastAPI routes
+  config.py                  models, canvas sizes, brand palette, asset paths
+  models.py                  BannerSpec and request/response schemas
+  services/
+    prompt_engine.py         brief -> BannerSpec, spec -> image prompt
+    image_gen.py             Gemini image generation and editing
+    composer.py              scrim, type, accent rule, locked logo placement
+    templates.py             layout geometry as fractions of the canvas
+  assets/brand/              logo files go here (see the README inside)
+  assets/fonts/              optional brand fonts
+  outputs/                   generated banners + their specs
+
+frontend/
+  src/App.tsx                state and orchestration
+  src/api.ts                 typed API client
+  src/types.ts               shared types
+  src/styles.css             design tokens and layout
+  src/components/
+    ControlDeck.tsx          brief, copy, layout, uploads, advanced controls
+    BannerStage.tsx          preview, locked-zone overlay, edit bar, download
+    TemplatePicker.tsx       layout chooser with wireframe glyphs
+    ImageDrop.tsx            reference / person / background uploads
+    ModeTabs.tsx             create · reference · edit
+    SpecInspector.tsx        the plan behind the banner
+```
+
+## Run it
+
+Backend:
+
+```bash
+cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # add your GEMINI_API_KEY
+uvicorn main:app --reload --port 8000
+```
+
+Frontend:
+
+```bash
+cd frontend
+npm install
+cp .env.example .env
+npm run dev                   # http://localhost:5173
+```
+
+Without an API key the app still runs: the planner falls back to keyword
+planning and the image step returns brand-coloured artwork, so you can develop
+and test composition, fonts and logo placement offline.
+
+## Installing the logo
+
+Put the marks in `backend/assets/brand/` as `logo-black.png`, `logo-white.png`,
+`footer-black.png`, `footer-white.png` — or drop one file into the "Install
+logo" prompt in the app. The composer samples the brightness behind each corner
+and picks the light or dark version automatically. If a file is missing it
+draws a text mark and says so in the banner's warnings.
+
+To move the marks, edit `LOGO_ZONE` and `FOOTER_ZONE` in
+`backend/services/templates.py`. The preview overlay in `BannerStage.tsx`
+mirrors those two constants — update both together.
+
+## Three modes
+
+- **Create** — a brief becomes a banner.
+- **Match a reference** — upload a banner, say what to keep and what to change.
+  The reference and the portrait both go to the image model as inputs.
+- **Edit** — one instruction re-runs the artwork and recomposes. Text and
+  layout changes skip the model entirely via `/api/recompose`, so fixing a
+  headline is instant and free.
+
+## API
+
+| Route                | Does                                                     |
+|----------------------|----------------------------------------------------------|
+| `GET  /api/health`   | Key status, brand name, missing brand assets             |
+| `GET  /api/templates`| Available layouts                                        |
+| `POST /api/plan`     | Interpret a brief without generating an image            |
+| `POST /api/generate` | Full pipeline, returns the banner and its spec           |
+| `POST /api/edit`     | Re-run artwork with an instruction, recompose            |
+| `POST /api/recompose`| Re-render type and layout over existing artwork          |
+| `POST /api/brand-asset` | Install a logo into a brand slot                      |
+| `GET  /media/*`      | Generated files                                          |
+
+## Notes on models
+
+Image model names live in `config.py` and are read from the environment, since
+Google renames these often. Check the current Gemini image-generation
+documentation before deploying and set `IMAGE_MODEL_FAST`, `IMAGE_MODEL_STANDARD`
+and `IMAGE_MODEL_PRO` accordingly. Nothing in the pipeline hard-codes a model.
+
+## Adding a layout
+
+Add an entry to `TEMPLATES` in `backend/services/templates.py`. Every rect is
+`(x, y, w, h)` as a fraction of the canvas, so one definition works at all five
+aspect ratios. The frontend picks up the new layout automatically — the
+wireframe glyph is drawn from the template's own text and subject positions.
+
+## Before production
+
+- Move `outputs/` to object storage and serve signed URLs.
+- Add auth, per-user history and rate limiting on the generate route.
+- Cache specs so a re-render never costs a second planner call.
+- Install the brand fonts in `assets/fonts/` and point `FONTS` at them;
+  the composer falls back to system fonts until you do.
 
