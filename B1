@@ -1,53 +1,40 @@
-outputs/*.png
-outputs/*.json
-__pycache__/
-node_modules/
-.env
-dist/
-
-
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-
-export default defineConfig({
-  plugins: [react()],
-  server: { port: 5173 },
-});
-
-
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Zensar Banner Studio</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;700;800&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap"
-      rel="stylesheet"
-    />
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
-
-
-
-
-import React from "react";
-import ReactDOM from "react-dom/client";
-import App from "./App";
-import "./styles.css";
-
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
-
-
-
-VITE_API_BASE=http://localhost:8000
+1:33:52 pm [vite] Internal server error: Failed to resolve import "./components/BannerStage" from "src/App.tsx". Does the file exist?
+  Plugin: vite:import-analysis
+  File: C:/Users/ST127673/Banner_Generator/frontend/src/App.tsx:2:24
+  17 |  var _s = $RefreshSig$();
+  18 |  import { useEffect, useRef, useState } from "react";
+  19 |  import BannerStage from "./components/BannerStage";
+     |                           ^
+  20 |  import ControlDeck from "./components/ControlDeck";
+  21 |  import SpecInspector from "./components/SpecInspector";
+      at TransformPluginContext._formatError (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49258:41)
+      at TransformPluginContext.error (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49253:16)
+      at normalizeUrl (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64307:23)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64439:39
+      at async Promise.all (index 4)
+      at async TransformPluginContext.transform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64366:7)
+      at async PluginContainer.transform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49099:18)
+      at async loadAndTransform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:51978:27)
+1:33:52 pm [vite] Pre-transform error: Failed to resolve import "./components/BannerStage" from "src/App.tsx". Does the file exist?
+1:33:52 pm [vite] ✨ new dependencies optimized: react-dom/client
+1:33:52 pm [vite] ✨ optimized dependencies changed. reloading
+1:33:53 pm [vite] Internal server error: Failed to resolve import "./components/BannerStage" from "src/App.tsx". Does the file exist?
+  Plugin: vite:import-analysis
+  File: C:/Users/ST127673/Banner_Generator/frontend/src/App.tsx:2:24
+  17 |  var _s = $RefreshSig$();
+  18 |  import { useEffect, useRef, useState } from "react";
+  19 |  import BannerStage from "./components/BannerStage";
+     |                           ^
+  20 |  import ControlDeck from "./components/ControlDeck";
+  21 |  import SpecInspector from "./components/SpecInspector";
+      at TransformPluginContext._formatError (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49258:41)
+      at TransformPluginContext.error (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49253:16)
+      at normalizeUrl (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64307:23)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64439:39
+      at async Promise.all (index 4)
+      at async TransformPluginContext.transform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:64366:7)
+      at async PluginContainer.transform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:49099:18)
+      at async loadAndTransform (file:///C:/Users/ST127673/Banner_Generator/frontend/node_modules/vite/dist/node/chunks/dep-BK3b2jBa.js:51978:27)
+1:33:53 pm [vite] Pre-transform error: Failed to resolve import "./components/BannerStage" from "src/App.tsx". Does the file exist?
