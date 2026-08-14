@@ -1,1 +1,265 @@
+import ImageDrop from "./ImageDrop";
+import ModeTabs from "./ModeTabs";
+import TemplatePicker from "./TemplatePicker";
+import type {
+  AspectRatio,
+  BannerSpec,
+  Mode,
+  Quality,
+  TemplateInfo,
+  Upload,
+} from "../types";
+
+const RATIOS: AspectRatio[] = ["16:9", "4:3", "1:1", "4:5", "9:16"];
+const QUALITIES: { id: Quality; label: string; note: string }[] = [
+  { id: "fast", label: "Draft", note: "Quick look" },
+  { id: "standard", label: "Standard", note: "Day to day" },
+  { id: "pro", label: "Print", note: "Launch assets" },
+];
+
+interface Props {
+  mode: Mode;
+  setMode: (mode: Mode) => void;
+  advanced: boolean;
+  setAdvanced: (value: boolean) => void;
+  brief: string;
+  setBrief: (value: string) => void;
+  overrides: Partial<BannerSpec>;
+  setOverride: <K extends keyof BannerSpec>(key: K, value: BannerSpec[K]) => void;
+  templates: TemplateInfo[];
+  quality: Quality;
+  setQuality: (value: Quality) => void;
+  reference: Upload | null;
+  setReference: (upload: Upload | null) => void;
+  person: Upload | null;
+  setPerson: (upload: Upload | null) => void;
+  background: Upload | null;
+  setBackground: (upload: Upload | null) => void;
+  referenceInstruction: string;
+  setReferenceInstruction: (value: string) => void;
+  busy: boolean;
+  onGenerate: () => void;
+}
+
+export default function ControlDeck(props: Props) {
+  const {
+    mode,
+    setMode,
+    advanced,
+    setAdvanced,
+    brief,
+    setBrief,
+    overrides,
+    setOverride,
+    templates,
+    quality,
+    setQuality,
+    reference,
+    setReference,
+    person,
+    setPerson,
+    background,
+    setBackground,
+    referenceInstruction,
+    setReferenceInstruction,
+    busy,
+    onGenerate,
+  } = props;
+
+  return (
+    <aside className="deck">
+      <ModeTabs mode={mode} onChange={setMode} />
+
+      <div className="field">
+        <label className="field__label" htmlFor="brief">
+          Brief
+        </label>
+        <textarea
+          id="brief"
+          className="input input--area"
+          rows={5}
+          placeholder="A banner about AI-powered software testing. A business executive in a modern technology environment."
+          value={brief}
+          onChange={(event) => setBrief(event.target.value)}
+        />
+        <p className="field__note">
+          Write it the way you would explain it to a designer. Everything below is optional.
+        </p>
+      </div>
+
+      {mode === "reference" && (
+        <>
+          <ImageDrop
+            label="Reference banner"
+            hint="Drop a banner whose look you want to reuse"
+            value={reference}
+            onChange={setReference}
+          />
+          <div className="field">
+            <label className="field__label" htmlFor="ref-instruction">
+              What to keep, what to change
+            </label>
+            <textarea
+              id="ref-instruction"
+              className="input input--area"
+              rows={3}
+              placeholder="Keep the layout and lighting. Swap the person for the uploaded portrait and make the background a cybersecurity operations centre."
+              value={referenceInstruction}
+              onChange={(event) => setReferenceInstruction(event.target.value)}
+            />
+          </div>
+        </>
+      )}
+
+      <ImageDrop
+        label="Person"
+        hint="Drop a portrait to place in the scene"
+        value={person}
+        onChange={setPerson}
+      />
+
+      <button
+        className="deck__toggle"
+        onClick={() => setAdvanced(!advanced)}
+        aria-expanded={advanced}
+      >
+        {advanced ? "Hide detailed controls" : "Show detailed controls"}
+      </button>
+
+      {advanced && (
+        <div className="deck__advanced">
+          <div className="field">
+            <label className="field__label" htmlFor="title">
+              Headline
+            </label>
+            <input
+              id="title"
+              className="input"
+              placeholder="Leave empty to let the planner write it"
+              value={overrides.title ?? ""}
+              onChange={(event) => setOverride("title", event.target.value)}
+            />
+          </div>
+
+          <div className="field">
+            <label className="field__label" htmlFor="description">
+              Body copy
+            </label>
+            <textarea
+              id="description"
+              className="input input--area"
+              rows={3}
+              value={overrides.description ?? ""}
+              onChange={(event) => setOverride("description", event.target.value)}
+            />
+          </div>
+
+          <div className="field">
+            <label className="field__label" htmlFor="cta">
+              Button label
+            </label>
+            <input
+              id="cta"
+              className="input"
+              placeholder="Read the report"
+              value={overrides.cta ?? ""}
+              onChange={(event) => setOverride("cta", event.target.value)}
+            />
+          </div>
+
+          <TemplatePicker
+            templates={templates}
+            value={overrides.template ?? ""}
+            onChange={(id) => setOverride("template", id)}
+          />
+
+          <div className="field">
+            <label className="field__label">Size</label>
+            <div className="chips">
+              {RATIOS.map((ratio) => (
+                <button
+                  key={ratio}
+                  className={`chip ${overrides.aspect_ratio === ratio ? "is-active" : ""}`}
+                  onClick={() => setOverride("aspect_ratio", ratio)}
+                >
+                  {ratio}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="field">
+            <label className="field__label">Text side</label>
+            <div className="chips">
+              {(["left", "center", "right"] as const).map((side) => (
+                <button
+                  key={side}
+                  className={`chip ${overrides.text_position === side ? "is-active" : ""}`}
+                  onClick={() => setOverride("text_position", side)}
+                >
+                  {side}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="field">
+            <label className="field__label">Person side</label>
+            <div className="chips">
+              {(["left", "center", "right", "none"] as const).map((side) => (
+                <button
+                  key={side}
+                  className={`chip ${overrides.subject_position === side ? "is-active" : ""}`}
+                  onClick={() => setOverride("subject_position", side)}
+                >
+                  {side}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="field">
+            <label className="field__label" htmlFor="scene">
+              Scene
+            </label>
+            <input
+              id="scene"
+              className="input"
+              placeholder="Modern data centre, cool light, shallow depth of field"
+              value={overrides.background ?? ""}
+              onChange={(event) => setOverride("background", event.target.value)}
+            />
+          </div>
+
+          <ImageDrop
+            label="Own background"
+            hint="Drop an image to use instead of a generated scene"
+            value={background}
+            onChange={setBackground}
+          />
+
+          <div className="field">
+            <label className="field__label">Output</label>
+            <div className="chips">
+              {QUALITIES.map((option) => (
+                <button
+                  key={option.id}
+                  className={`chip ${quality === option.id ? "is-active" : ""}`}
+                  onClick={() => setQuality(option.id)}
+                  title={option.note}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <button className="generate" onClick={onGenerate} disabled={busy}>
+        {busy ? "Generating…" : "Generate banner"}
+      </button>
+    </aside>
+  );
+}
 
