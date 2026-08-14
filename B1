@@ -1,1 +1,345 @@
 
+"""Sales Banner editor.
+
+Unlike a generator that builds a banner from nothing, this edits one of your
+existing finished designs: the layout, logo, colours and decorative elements
+in assets/Templates/ are preserved pixel-for-pixel, and only the headline,
+body copy, and person are swapped based on what the user fills in. The final
+free-text "prompt" field lets the user layer on anything else on top of that.
+
+FRAMEWORK ASSUMPTION: this is written as a Flask Blueprint because the
+frontend calls a URL shaped like a Flask blueprint prefix
+(/batch_process/sales_platform/banner/...). If your app is actually FastAPI
+or something else, say so and this converts in one pass — the Gemini call,
+prompt building, and template discovery logic underneath are framework
+agnostic and would move over unchanged.
+
+Wire it into your app factory with:
+    from hls_platform.sales_banner import banner_bp
+    app.register_blueprint(banner_bp)
+
+If your app already has an auth decorator (something that reads the
+Authorization: Bearer <token> header the frontend sends), apply it to
+generate_banner() and list_templates() — none is assumed here since this
+file doesn't have access to your auth module.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from flask import Blueprint, jsonify, request, send_file
+
+# ---------------------------------------------------------------------------
+# Paths and config
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = BASE_DIR / "assets" / "Templates"
+THUMB_CACHE_DIR = TEMPLATES_DIR / ".thumbcache"
+OUTPUT_DIR = BASE_DIR / "assets" / "Generated"
+
+for _d in (TEMPLATES_DIR, THUMB_CACHE_DIR, OUTPUT_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+IMAGE_MODEL = os.getenv("SALES_BANNER_IMAGE_MODEL", "gemini-3.1-flash-image")
+
+banner_bp = Blueprint(
+    "sales_banner",
+    __name__,
+    url_prefix="/batch_process/sales_platform/banner",
+)
+
+
+# ---------------------------------------------------------------------------
+# Template discovery
+# ---------------------------------------------------------------------------
+#
+# Drop a new image into assets/Templates/ and it shows up in the picker on
+# the next request — no code change, no restart. Filenames in that folder
+# are often GUIDs or screenshot names, not something you'd want a user to
+# see, so an optional sidecar file lets you curate the label and order
+# without renaming the actual image:
+#
+#   assets/Templates/templates.json
+#   {
+#     "1786349157834": {"name": "Corporate Achievement", "order": 1},
+#     "cbece270-426b-4bae-8548-ef6e1266cd38": {"name": "Team Milestone", "order": 2}
+#   }
+#
+# Any template file without an entry still appears, using a prettified
+# version of its filename, sorted after the curated ones.
+
+
+def _load_overrides() -> dict:
+    path = TEMPLATES_DIR / "templates.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _prettify(stem: str) -> str:
+    name = re.sub(r"[_\-]+", " ", stem).strip()
+    # Looks like a GUID or a pure-numeric screenshot id — nothing readable
+    # to extract, so at least don't show a wall of hex.
+    if re.fullmatch(r"[0-9a-f-]{8,}", name.replace(" ", "").lower()) or name.isdigit():
+        return "Untitled template"
+    return name.title()
+
+
+def _mime_for(path: Path) -> str:
+    return {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+    }.get(path.suffix.lower().lstrip("."), "image/png")
+
+
+def discover_templates() -> list[dict]:
+    overrides = _load_overrides()
+    templates = []
+    for path in TEMPLATES_DIR.iterdir():
+        if path.suffix.lower() not in ALLOWED_EXT:
+            continue
+        override = overrides.get(path.stem, {})
+        try:
+            from PIL import Image
+
+            with Image.open(path) as img:
+                width, height = img.size
+        except Exception:
+            width, height = (1, 1)
+
+        aspect = width / height if height else 1.0
+        # Snap to the nearest common ratio for a clean default selection —
+        # the raw pixel ratio (e.g. 1.7812) is not what a user picks from.
+        common = {"16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "4:5": 4 / 5, "9:16": 9 / 16}
+        nearest = min(common, key=lambda k: abs(common[k] - aspect))
+
+        templates.append(
+            {
+                "id": path.stem,
+                "name": override.get("name") or _prettify(path.stem),
+                "order": override.get("order", 999),
+                "width": width,
+                "height": height,
+                "native_aspect_ratio": nearest,
+                "thumbnail_url": f"/batch_process/sales_platform/banner/templates/{path.stem}/image?w=480",
+                "full_image_url": f"/batch_process/sales_platform/banner/templates/{path.stem}/image",
+            }
+        )
+
+    templates.sort(key=lambda t: (t["order"], t["name"]))
+    return templates
+
+
+def _find_template_file(template_id: str) -> Optional[Path]:
+    # Reject path traversal before touching the filesystem.
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", template_id):
+        return None
+    for ext in ALLOWED_EXT:
+        candidate = TEMPLATES_DIR / f"{template_id}{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _thumbnail(path: Path, width: int) -> Path:
+    cache_path = THUMB_CACHE_DIR / f"{path.stem}-{width}.png"
+    if cache_path.exists() and cache_path.stat().st_mtime >= path.stat().st_mtime:
+        return cache_path
+    from PIL import Image
+
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        scale = width / img.width
+        img = img.resize((width, max(1, round(img.height * scale))))
+        img.save(cache_path, format="PNG")
+    return cache_path
+
+
+# ---------------------------------------------------------------------------
+# Routes: template listing / serving
+# ---------------------------------------------------------------------------
+
+
+@banner_bp.route("/templates", methods=["GET"])
+def list_templates():
+    return jsonify({"success": True, "templates": discover_templates()})
+
+
+@banner_bp.route("/templates/<template_id>/image", methods=["GET"])
+def get_template_image(template_id: str):
+    path = _find_template_file(template_id)
+    if path is None:
+        return jsonify({"success": False, "error": "Template not found"}), 404
+
+    width_param = request.args.get("w", type=int)
+    if width_param and 32 <= width_param <= 4000:
+        try:
+            path = _thumbnail(path, width_param)
+        except Exception:
+            pass  # fall back to the full image rather than fail the request
+
+    return send_file(path, mimetype=_mime_for(path))
+
+
+# ---------------------------------------------------------------------------
+# Gemini editing
+# ---------------------------------------------------------------------------
+
+
+def _client():
+    if not GEMINI_API_KEY:
+        return None
+    from google import genai
+
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
+def _decode_data_url(value: str) -> bytes:
+    if value.strip().startswith("data:") and "," in value[:80]:
+        value = value.split(",", 1)[1]
+    return base64.b64decode(value)
+
+
+def _build_prompt(title: str, description: str, custom_prompt: str, has_photo: bool) -> str:
+    parts = [
+        "You are editing an existing marketing banner image, not creating a "
+        "new one. Preserve the banner's exact layout, background, "
+        "decorative shapes, colour palette, logo, and the logo's position "
+        "pixel-for-pixel. Do not redesign, restyle, or move anything that "
+        "is not explicitly called out below."
+    ]
+    if title:
+        parts.append(f'Replace the main headline text with: "{title}".')
+    if description:
+        parts.append(f'Replace the supporting body text with: "{description}".')
+    if has_photo:
+        parts.append(
+            "Replace the person currently shown in the banner with the "
+            "person in the second supplied image. Match the original "
+            "person's pose, framing, crop, and lighting as closely as "
+            "possible so the new person sits naturally in the same spot — "
+            "do not change where the person is positioned in the frame."
+        )
+    else:
+        parts.append("Keep the existing person in the banner exactly as they are.")
+    if custom_prompt:
+        parts.append(f"Additional instruction from the user: {custom_prompt.strip()}")
+    parts.append(
+        "Keep all text sharp, correctly spelled, and legible. Do not add "
+        "any new logos, watermarks, or text that wasn't requested."
+    )
+    return " ".join(parts)
+
+
+def _extract_image(response) -> Optional[bytes]:
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                data = inline.data
+                return data if isinstance(data, bytes) else base64.b64decode(data)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Route: generate
+# ---------------------------------------------------------------------------
+
+
+@banner_bp.route("/generate", methods=["POST"])
+def generate_banner():
+    payload = request.get_json(silent=True) or {}
+
+    template_id = (payload.get("template_id") or "").strip()
+    title = (payload.get("title") or "").strip()
+    description = (payload.get("description") or "").strip()
+    custom_prompt = (payload.get("prompt") or "").strip()
+    aspect_ratio = (payload.get("aspect_ratio") or "").strip()
+    photo_b64 = payload.get("photo")
+
+    if not template_id:
+        return jsonify({"success": False, "error": "Select a template first."}), 400
+    if not title and not description and not custom_prompt:
+        return jsonify(
+            {"success": False, "error": "Add a title, description, or instruction."}
+        ), 400
+
+    template_path = _find_template_file(template_id)
+    if template_path is None:
+        return jsonify({"success": False, "error": f"Unknown template '{template_id}'."}), 404
+
+    client = _client()
+    if client is None:
+        return jsonify(
+            {"success": False, "error": "GEMINI_API_KEY is not configured on the server."}
+        ), 502
+
+    from google.genai import types
+
+    parts: list = [
+        types.Part.from_bytes(
+            data=template_path.read_bytes(), mime_type=_mime_for(template_path)
+        )
+    ]
+
+    if photo_b64:
+        try:
+            photo_bytes = _decode_data_url(photo_b64)
+        except Exception:
+            return jsonify({"success": False, "error": "Could not read the uploaded photo."}), 400
+        parts.append(types.Part.from_bytes(data=photo_bytes, mime_type="image/png"))
+
+    parts.append(_build_prompt(title, description, custom_prompt, has_photo=bool(photo_b64)))
+
+    config_kwargs: dict = {"response_modalities": ["TEXT", "IMAGE"]}
+    try:
+        config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio or "16:9")
+    except AttributeError:
+        pass  # older/newer SDK without ImageConfig — edit still runs, just without the hint
+
+    try:
+        response = client.models.generate_content(
+            model=IMAGE_MODEL,
+            contents=parts,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+    except Exception as exc:
+        return jsonify({"success": False, "error": f"Image model call failed: {exc}"}), 502
+
+    image_bytes = _extract_image(response)
+    if not image_bytes:
+        return jsonify(
+            {
+                "success": False,
+                "error": "The model did not return an image. Try again, or simplify the instruction.",
+            }
+        ), 502
+
+    banner_id = uuid.uuid4().hex[:12]
+    (OUTPUT_DIR / f"{banner_id}.png").write_bytes(image_bytes)
+
+    return jsonify(
+        {
+            "success": True,
+            "banner_id": banner_id,
+            "template_id": template_id,
+            "image_base64": f"data:image/png;base64,{base64.b64encode(image_bytes).decode()}",
+        }
+    )
