@@ -1,6 +1,1583 @@
-New-Item -ItemType Directory -Force -Path "C:\Users\ST127673\Ai_engineering_buddy\batch_process\src\hls_platform\assets\Templates" | Out-Null
-Copy-Item "C:\Users\ST127673\Ai_engineering_buddy\engg-buddy-ui-facelift\src\hls_src\assets\Templates\*" -Destination "C:\Users\ST127673\Ai_engineering_buddy\batch_process\src\hls_platform\assets\Templates\"
-Get-ChildItem "C:\Users\ST127673\Ai_engineering_buddy\batch_process\src\hls_platform\assets\Templates"
+import asyncio
+import os
+import io
+import json
+import logging
+import re
+from ..utils.utils import getOSpecifiers
+from common.llm_utils.litellm_aexecute import image_llm_aexecute
+from src.hls_platform.hls_constants import get_constant
+from PIL import Image
+from common.database.models.content_factory import HLSBrand, HLSTransaction
+from ..hls_platform.connectors.connector_factory import HLSDomainType
+# from google import genai
+# from google.genai import types
+from ..hls_platform.utils import initialize_5o_mini_llm
+from .brands import BRAND_LOGOS_BASE_DIR
+# from .hls_constants import get_constant
 
 
-C:\Users\ST127673\Ai_engineering_buddy\engg-buddy-ui-facelift\src\hls_src\assets\Templates
+from fastapi import Request, Depends
+from fastapi.responses import JSONResponse, Response
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+logger = logging.getLogger(__name__)
+
+
+# Gemini-supported aspect ratios with display names
+BANNER_SIZES = {
+    '1:1':  'Square',
+    '3:2':  'Standard Landscape',
+    '2:3':  'Standard Portrait',
+    '3:4':  'Portrait',
+    '4:3':  'Landscape',
+    '4:5':  'Tall Square',
+    '5:4':  'Wide Square',
+    '9:16': 'Story / Skyscraper',
+    '16:9': 'Widescreen',
+    '21:9': 'Ultra Widescreen',
+}
+
+# Layout hints per ratio for the image generation prompt
+LAYOUT_HINTS = {
+    '21:9': "ultra-wide horizontal strip — bold headline far left, dominant visual centre-right",
+    '16:9': "wide horizontal strip — bold headline on the left, dominant visual on the right",
+    '3:2':  "landscape rectangle — visual dominant left two-thirds, text right third",
+    '4:3':  "landscape rectangle — two-zone split: visual left half, headline + supporting line right half",
+    '5:4':  "slightly landscape rectangle — headline top, visual centre",
+    '1:1':  "square — centred composition: headline top, dominant visual middle",
+    '4:5':  "slightly portrait rectangle — headline top, visual large centre",
+    '3:4':  "portrait rectangle — stacked top-to-bottom: headline, visual, supporting line",
+    '2:3':  "portrait rectangle — stacked: headline, visual",
+    '9:16': "tall vertical strip — stacked: small icon top, large bold headline upper-middle, supporting line below",
+}
+
+
+def get_aspect_ratio(size_str: str) -> tuple[str, str]:
+    """Return (ratio, label) for a supported Gemini aspect ratio string. Raises ValueError if unsupported."""
+    s = size_str.strip()
+    if s in BANNER_SIZES:
+        return s, BANNER_SIZES[s]
+    supported = ', '.join(BANNER_SIZES.keys())
+    raise ValueError(f"Unsupported aspect ratio '{size_str}'. Gemini supports: {supported}")
+
+
+async def get_brand_logo_bytes(
+    brand_name: str,
+    db: AsyncSession
+) -> tuple[bytes | None, str]:
+    """Look up brand logo from DB by brand name and return (bytes, mime_type)."""
+    try:
+        result = await db.execute(
+            select(HLSBrand).where(
+                HLSBrand.fieldname == 'brand_name',
+                HLSBrand.fieldvalue == brand_name
+            )
+        )
+        name_row = result.scalars().first()
+
+        if not name_row:
+            logger.info(f"Brand '{brand_name}' not found in DB")
+            return None, ''
+
+        result = await db.execute(
+            select(HLSBrand).where(
+                HLSBrand.brand_id == name_row.brand_id,
+                HLSBrand.fieldname == 'brand_logo'
+            )
+        )
+        logo_row = result.scalars().first()
+
+        if not logo_row or not logo_row.fieldvalue:
+            logger.info(f"No logo found for brand '{brand_name}'")
+            return None, ''
+
+        # Stored as "hls_brand_logos/<brand_id>/<filename>"
+        rel = logo_row.fieldvalue
+
+        if rel.startswith('hls_brand_logos/') or rel.startswith('hls_brand_logos\\'):
+            rel = rel[len('hls_brand_logos/'):]
+
+        logo_path = os.path.join(BRAND_LOGOS_BASE_DIR, rel)
+
+        if not os.path.exists(logo_path):
+            logger.warning(f"Logo file not found on disk: {logo_path}")
+            return None, ''
+
+        ext = os.path.splitext(logo_path)[1].lower()
+        mime_map = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp'
+        }
+        mime_type = mime_map.get(ext, 'image/png')
+
+        with open(logo_path, 'rb') as f:
+            return f.read(), mime_type
+
+    except Exception as e:
+        logger.warning(f"Could not load brand logo for '{brand_name}': {e}")
+        return None, ''
+
+
+def generate_hero_banner_prompt(llm, content: str, aspect_ratio: str,
+                                 size_label: str, intent: str,
+                                 brand_name: str, has_logo: bool,
+                                 feedback: str = '') -> str:
+    """Use LLM to craft a Gemini image-generation prompt for a hero banner.
+    Pass feedback to refine an existing version.
+    """
+
+    layout_hint = LAYOUT_HINTS.get(aspect_ratio, LAYOUT_HINTS["16:9"])
+
+    logo_instruction = (
+        "MANDATORY — A brand logo image IS PROVIDED as an input image. "
+        "You MUST embed it visibly in the final banner: place it in the top-left or bottom-right corner, "
+        "scaled proportionally, never distorted, never cropped, never faded. "
+        "The logo must be clearly legible at all times. Omitting the logo is NOT acceptable."
+        if has_logo else
+        "No logo provided — do not fabricate one."
+    )
+
+    # Split "Brand Name - color palette info" if present
+    brand_parts = brand_name.split(' - ', 1) if brand_name else []
+    brand_display = brand_parts[0].strip() if brand_parts else ''
+    color_palette_info = brand_parts[1].strip() if len(brand_parts) > 1 else ''
+
+    brand_instruction = ''
+    if brand_display:
+        brand_instruction = f"• Brand name   : {brand_display}"
+    if color_palette_info:
+        brand_instruction += f"\n• Color palette: {color_palette_info} — use these exact brand colors throughout"
+
+    intent_line = f"• Campaign intent: {intent}" if intent else ''
+
+    feedback_section = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REFINEMENT FEEDBACK — apply all of the following changes to the new prompt:
+{feedback}
+""" if feedback else ''
+
+    prompt = f"""
+You are an award-winning digital advertising creative director specialising in pharma and healthcare hero banners.
+
+Your task: produce ONE highly detailed image-generation prompt to create a professional hero banner.
+{feedback_section}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SOURCE CONTENT (use in full):
+{content}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BANNER SPECS:
+• Aspect ratio : {aspect_ratio}  ({size_label})
+• Layout       : {layout_hint}
+{intent_line}
+{brand_instruction}
+• Logo         : {logo_instruction}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HERO BANNER PRINCIPLES — follow ALL strictly:
+
+1. HEADLINE (MANDATORY) — one bold headline directly derived from the source content AND campaign intent; max 10 words; placed prominently over the background
+2. CAPTION (MANDATORY) — one concise caption line placed directly below the headline; must reinforce the content and intent as a benefit statement or proof point; never skip this
+3. BACKGROUND IMAGE (MANDATORY) — a full-bleed, contextually relevant photographic or illustrated scene derived from the document content; it fills the entire canvas as a background layer; text is overlaid on top with sufficient contrast (use a semi-transparent dark/light overlay or frosted panel behind text if needed for legibility)
+4. Brand logo — placed exactly as instructed above; MANDATORY if provided — treat as a hard requirement, never omit
+5. CLEAN text overlay — headline and caption centered or left-aligned over background; generous spacing; strong typographic hierarchy; nothing crowded
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUALITY STANDARDS:
+• Ultra-sharp, premium resolution at {aspect_ratio} aspect ratio
+• Modern pharma/healthcare aesthetic — think leading campaign quality
+• Background image must be a rich, realistic, full-bleed scene directly relevant to the document subject — not a pattern, not flat white, not abstract shapes
+• If background contains any human figures or faces: ZERO distortions — anatomically correct, natural proportions, lifelike skin, no merged limbs, no extra fingers, no blurred faces; photorealistic quality mandatory
+• Colors MUST follow brand palette if provided; otherwise max 3 harmonious colors
+• Clean sans-serif typography; bold headline, lighter caption below
+• No logos of real companies, no regulatory text, no fine print
+• Depth through soft shadows, a subtle dark/light gradient overlay on background for text contrast
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT RULES:
+• Return ONLY the final image-generation prompt — no explanation, no markdown
+• Must include: aspect ratio {aspect_ratio}, exact headline text from content, exact caption text from content, full-bleed background scene description, human figure quality instructions (if humans present), color palette, logo placement
+• All content derived from source — no hallucinated facts
+
+Generate the hero banner prompt now.
+"""
+    response = llm.invoke(prompt)
+    image_prompt = response.content.strip()
+    print(f"🎨 Hero banner prompt ({aspect_ratio} — {size_label}):\n{image_prompt[:300]}...")
+    return image_prompt
+
+
+async def generate_banner_image(
+    image_prompt: str,
+    db: AsyncSession,
+    logo_bytes: bytes | None = None,
+    logo_mime: str = "image/png"
+) -> bytes:
+    """Call LiteLLM Gemini to generate the banner. Passes logo as image input if provided."""
+    print("🖼️  Calling LiteLLM Gemini for hero banner generation...")
+
+    if logo_bytes:
+        print(f"🏷️  Brand logo included ({len(logo_bytes)} bytes, {logo_mime})")
+
+    result = await image_llm_aexecute(
+        prompt=image_prompt,
+        db=db,
+        image_bytes=logo_bytes,
+        image_mime=logo_mime
+    )
+
+    if result.get("status_code") != 200:
+        raise ValueError(
+            result.get("message")
+            or result.get("error")
+            or "LiteLLM Gemini image generation failed"
+        )
+
+    image_data = result.get("image_bytes")
+
+    if not image_data:
+        raise ValueError("No image bytes returned from LiteLLM Gemini")
+
+    return image_data
+
+
+async def handle_banner(
+    document_content,
+    format_type,
+    output_folder,
+    downloaded_files,
+    domain: HLSDomainType,
+    db: AsyncSession,
+    user_id=None,
+    user_name=None,
+    transaction_uuid=None,
+    input_folder=None,
+    banner_options=None
+):
+    print("\n🎨 Generating Hero Banner...\n")
+
+    try:
+        banner_options = banner_options or {}
+
+        size_str = banner_options.get("size", "16:9")
+        intent = banner_options.get("intent", "")
+        brand_name = banner_options.get("brand_guidelines", "")
+
+        aspect_ratio, size_label = get_aspect_ratio(size_str)
+        print(f"📐 Aspect ratio: {aspect_ratio} ({size_label})")
+
+        # brand_name may be "Brand Name - color palette info"; extract just the name for logo lookup
+        brand_name_only = brand_name.split(' - ', 1)[0].strip() if brand_name else ''
+
+        if brand_name_only:
+            logo_bytes, logo_mime = await get_brand_logo_bytes(brand_name_only, db)
+        else:
+            logo_bytes, logo_mime = None, ''
+
+        if logo_bytes:
+            print(f"🏷️  Brand logo loaded for '{brand_name_only}'")
+        else:
+            print("ℹ️  No brand logo — generating without logo")
+
+        # Step 1: LLM generates image prompt
+        llm = await initialize_5o_mini_llm(db, domain)
+
+        image_prompt = await asyncio.to_thread(
+            generate_hero_banner_prompt,
+            llm,
+            document_content,
+            aspect_ratio,
+            size_label,
+            intent,
+            brand_name,
+            bool(logo_bytes)
+        )
+
+        # Step 2: Gemini generates image
+        
+        # Step 2: LiteLLM Gemini generates image
+
+        image_data = await generate_banner_image(
+            image_prompt,
+            db,
+            logo_bytes,
+            logo_mime,
+        )
+
+
+        if not image_data:
+            raise ValueError("No image data returned from Gemini")
+
+        # Save file
+        os.makedirs(output_folder, exist_ok=True)
+
+        base_names = []
+
+        for filename in downloaded_files:
+            base = os.path.splitext(filename)[0]
+            base = re.sub(r'[^\w\s-]', '', base)
+            base = re.sub(r'[-\s]+', '_', base)
+            base_names.append(base)
+
+        ratio_tag = aspect_ratio.replace(':', 'x')
+        format_part = format_type.replace(' ', '_')
+        source_part = '_'.join(base_names)
+
+        if not source_part:
+            source_part = "banner"
+
+        base_filename = f"{format_part}_{source_part}_{ratio_tag}"
+
+        counter = 1
+        file_name = f"{base_filename}.png"
+        file_path = os.path.join(output_folder, file_name)
+
+        while os.path.exists(file_path):
+            counter += 1
+            file_name = f"{base_filename}_{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
+
+        image = Image.open(io.BytesIO(image_data))
+        image.save(file_path, 'PNG')
+
+        print(f"✅ Banner saved: {file_path}")
+
+        # Save DB transaction
+        if user_id and transaction_uuid and input_folder:
+            try:
+                input_file_paths_json = json.dumps([
+                    os.path.abspath(os.path.join(input_folder, f))
+                    for f in downloaded_files
+                ])
+
+                db.add(
+                    HLSTransaction(
+                        uuid=transaction_uuid,
+                        format_type=format_type,
+                        input_file_paths=input_file_paths_json,
+                        output_file_path=os.path.abspath(file_path),
+                        created_by=str(user_id),
+                        created_person=str(user_name),
+                        domain=domain
+                    )
+                )
+
+                await db.commit()
+                print(f"✅ Transaction saved: {transaction_uuid}")
+
+            except Exception as db_error:
+                print(f"⚠️  DB save failed: {db_error}")
+                await db.rollback()
+
+        with open(file_path, 'rb') as f:
+            final_image_data = f.read()
+
+        return Response(
+            content=final_image_data,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "X-Transaction-UUID": str(transaction_uuid),
+                "Access-Control-Expose-Headers": "X-Transaction-UUID"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in handle_banner: {e}")
+        print(f"❌ Hero banner generation failed: {e}")
+
+        import traceback
+        traceback.print_exc()
+
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500
+        )
+
+async def handle_workflow_banner(
+    document_content,
+    format_type,
+    output_folder,
+    domain: HLSDomainType,
+    db: AsyncSession,
+    user_id=None,
+    user_name=None,
+    transaction_uuid=None,
+    input_folder=None,
+    banner_options=None,
+    workflow_meta=None
+):
+    print("\n🎨 Generating Hero Banner...\n")
+
+    try:
+        banner_options = banner_options or {}
+
+        size_str = banner_options.get("size", "16:9")
+        intent = banner_options.get("intent", "")
+        brand_name = banner_options.get("brand_guidelines", "")
+
+        aspect_ratio, size_label = get_aspect_ratio(size_str)
+
+        print(f"📐 Aspect ratio: {aspect_ratio} ({size_label})")
+
+        # brand_name may be "Brand Name - color palette info"; extract just the name for logo lookup
+        brand_name_only = brand_name.split(' - ', 1)[0].strip() if brand_name else ''
+
+        if brand_name_only:
+            logo_bytes, logo_mime = await get_brand_logo_bytes(brand_name_only, db)
+        else:
+            logo_bytes, logo_mime = None, ''
+
+        if logo_bytes:
+            print(f"🏷️  Brand logo loaded for '{brand_name_only}'")
+        else:
+            print("ℹ️  No brand logo — generating without logo")
+
+        # Step 1: LLM generates image prompt
+        llm = await initialize_5o_mini_llm(db=db, domain=domain)
+
+        image_prompt = await asyncio.to_thread(
+            generate_hero_banner_prompt,
+            llm,
+            document_content,
+            aspect_ratio,
+            size_label,
+            intent,
+            brand_name,
+            bool(logo_bytes)
+        )
+
+        # Step 2: Gemini generates image
+        image_data = await generate_banner_image(
+            image_prompt,
+            db,
+            logo_bytes,
+            logo_mime
+        )
+
+        if not image_data:
+            raise ValueError("No image data returned from Gemini")
+
+        # Save file
+        os.makedirs(output_folder, exist_ok=True)
+
+        ratio_tag = aspect_ratio.replace(':', 'x')
+        format_part = format_type.replace(' ', '_')
+        source_part = re.sub(r'[^\w\s-]', '', brand_name)
+        source_part = re.sub(r'[-\s]+', '_', source_part)
+
+        base_filename = f"{format_part}_{source_part}_{ratio_tag}"
+
+        counter = 1
+        file_name = f"{base_filename}.png"
+        file_path = os.path.join(output_folder, file_name)
+
+        while os.path.exists(file_path):
+            counter += 1
+            file_name = f"{base_filename}_{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
+
+        image = Image.open(io.BytesIO(image_data))
+        image.save(file_path, 'PNG')
+
+        print(f"✅ Banner saved: {file_path}")
+
+        # Save DB transaction
+        if user_id and transaction_uuid and input_folder:
+            try:
+                input_file_paths_json = json.dumps([os.path.abspath(input_folder)])
+                wf = workflow_meta or {}
+
+                db.add(HLSTransaction(
+                    uuid=transaction_uuid,
+                    format_type=format_type,
+                    input_file_paths=input_file_paths_json,
+                    output_file_path=os.path.abspath(file_path),
+                    created_by=str(user_id),
+                    created_person=str(user_name),
+                    domain=domain,
+                    is_workflow=bool(wf.get('is_workflow', False)),
+                    workflow_type=wf.get('workflow_type'),
+                    workflow_run_id=wf.get('workflow_run_id'),
+                    workflow_step_name=wf.get('workflow_step_name'),
+                ))
+
+                await db.commit()
+                print(f"✅ Transaction saved: {transaction_uuid}")
+
+            except Exception as db_error:
+                print(f"⚠️  DB save failed: {db_error}")
+                await db.rollback()
+
+        with open(file_path, 'rb') as f:
+            final_image_data = f.read()
+
+        return Response(
+            content=final_image_data,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "X-Transaction-UUID": str(transaction_uuid),
+                "Access-Control-Expose-Headers": "X-Transaction-UUID"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in handle_workflow_banner: {e}")
+        print(f"❌ Hero banner generation failed: {e}")
+
+        import traceback
+        traceback.print_exc()
+
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500
+        )
+
+async def refine_banner_image(
+    image_bytes: bytes,
+    image_mime: str,
+    feedback: str,
+    db: AsyncSession
+) -> bytes:
+    """Send the existing banner image + user feedback to LiteLLM Gemini for refinement."""
+    print(f"✏️  Refining banner image with feedback: {feedback[:120]}...")
+
+    refinement_prompt = f"""You are a professional banner image editor. You have been given an existing hero banner image.
+
+YOUR ONLY JOB: Apply EXACTLY the changes described in the USER REQUEST below — nothing else.
+
+USER REQUEST:
+{feedback}
+
+STRICT RULES — you MUST follow all of these without exception:
+1. ONLY change what the user explicitly asked for. Every other element must remain pixel-perfect identical.
+2. PRESERVE the exact aspect ratio and canvas dimensions of the original image — do NOT crop, letterbox, or resize.
+3. PRESERVE all text — headlines, captions, body copy — exactly as they appear: same wording, same font style, same size, same position, same color, unless the user explicitly asked to change text.
+4. PRESERVE the brand logo — same position, same size, same appearance. Never move, resize, recolor, or remove it.
+5. PRESERVE the overall layout and composition — element positions, alignment zones, and spacing must stay the same.
+6. PRESERVE image resolution and output quality — match the original sharpness, detail level, and file quality.
+7. PRESERVE the color palette for all unchanged elements — do not drift or reinterpret colors elsewhere in the image.
+8. PRESERVE typography hierarchy — font weights, sizes, and styles must not change unless explicitly requested.
+9. Do NOT add new elements, decorations, watermarks, or design features that were not in the original.
+10. Do NOT reinterpret the overall design — this is a surgical edit, not a redesign.
+
+Apply only the requested change now and return the edited image."""
+
+    result = await image_llm_aexecute(
+        prompt=refinement_prompt,
+        db=db,
+        image_bytes=image_bytes,
+        image_mime=image_mime
+    )
+
+    if result.get("status_code") != 200:
+        raise ValueError(
+            result.get("message")
+            or result.get("error")
+            or "LiteLLM Gemini image refinement failed"
+        )
+
+    image_data = result.get("image_bytes")
+
+    if not image_data:
+        raise ValueError("No image bytes returned from LiteLLM Gemini during refinement")
+
+    return image_data
+
+
+async def handle_banner_refine(
+    request: Request,
+    domain: HLSDomainType,
+    db: AsyncSession
+):
+    """Refine an existing banner under the same transaction UUID."""
+
+    try:
+        data = await request.json()
+
+        transaction_uuid = data.get('transaction_uuid', '').strip()
+        feedback = data.get('feedback', '').strip()
+        user_id = data.get('user_id', '')
+        user_name = data.get('user_name', '')
+
+        if not transaction_uuid:
+            return JSONResponse(
+                content={"success": False, "error": "Missing transaction_uuid"},
+                status_code=400
+            )
+
+        if not feedback:
+            return JSONResponse(
+                content={"success": False, "error": "Missing feedback"},
+                status_code=400
+            )
+
+        # Look up the transaction to find the current image path
+        result = await db.execute(
+            select(HLSTransaction).where(
+                HLSTransaction.uuid == transaction_uuid
+            )
+        )
+        transaction = result.scalars().first()
+
+        if not transaction:
+            return JSONResponse(
+                content={"success": False, "error": "Transaction not found"},
+                status_code=404
+            )
+
+        existing_edits = (
+            json.loads(transaction.edited_file_paths)
+            if transaction.edited_file_paths
+            else []
+        )
+
+        # Resolve which version to refine from.
+        # source_version_idx: 0 = original, 1 = first edit, 2 = second edit, ...
+        source_version_idx = data.get('source_version_idx')
+
+        if source_version_idx is None:
+            current_image_path = (
+                existing_edits[-1]
+                if existing_edits
+                else transaction.output_file_path
+            )
+        else:
+            
+            try:
+                source_version_idx = int(source_version_idx)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    content={"success": False, "error": "Invalid source_version_idx"},
+                    status_code=400
+                )
+
+
+            if source_version_idx == 0:
+                current_image_path = transaction.output_file_path
+            else:
+                edit_idx = source_version_idx - 1
+
+                if edit_idx >= len(existing_edits):
+                    return JSONResponse(
+                        content={
+                            "success": False,
+                            "error": f"Version {source_version_idx} not found "
+                                     f"(only {len(existing_edits)} edits exist)"
+                        },
+                        status_code=404
+                    )
+
+                current_image_path = existing_edits[edit_idx]
+
+        if not current_image_path or not os.path.exists(current_image_path):
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "error": "Current banner image not found on disk"
+                },
+                status_code=404
+            )
+
+        with open(current_image_path, 'rb') as f:
+            current_image_bytes = f.read()
+
+        ext = os.path.splitext(current_image_path)[1].lower()
+        image_mime = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg'
+        }.get(ext, 'image/png')
+
+        print(
+            f"🖼️  Refining banner from disk: "
+            f"{current_image_path} ({len(current_image_bytes)} bytes)"
+        )
+
+        # Send image + feedback directly to Gemini
+        api_key = await get_constant("gemini_api_key", db)
+
+        image_data = await asyncio.to_thread(
+            refine_banner_image,
+            current_image_bytes,
+            image_mime,
+            feedback,
+            api_key
+        )
+
+
+        if not image_data:
+            raise ValueError("No image data returned from Gemini")
+
+        # Save into the same transaction output folder
+        output_folder = os.path.dirname(transaction.output_file_path)
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Version number = how many edited files already exist + 2
+        version_num = len(existing_edits) + 2
+
+        base = os.path.splitext(os.path.basename(transaction.output_file_path))[0]
+        file_name = f"{base}_v{version_num}.png"
+        file_path = os.path.join(output_folder, file_name)
+
+        # Ensure unique filename
+        counter = version_num
+
+        while os.path.exists(file_path):
+            counter += 1
+            file_name = f"{base}_v{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
+
+        image = Image.open(io.BytesIO(image_data))
+        image.save(file_path, 'PNG')
+
+        print(f"✅ Refined banner saved: {file_path}")
+
+        # Append to edited_file_paths in DB
+        existing_edits.append(os.path.abspath(file_path))
+        transaction.edited_file_paths = json.dumps(existing_edits)
+
+        await db.commit()
+
+        print(f"✅ edited_file_paths updated ({len(existing_edits)} edits)")
+
+        with open(file_path, 'rb') as rf:
+            final_refined_data = rf.read()
+
+        return Response(
+            content=final_refined_data,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "X-Transaction-UUID": str(transaction_uuid),
+                "X-Version-Number": str(version_num),
+                "Access-Control-Expose-Headers": "X-Transaction-UUID, X-Version-Number"
+            }
+        )
+
+    except Exception as e:
+        await db.rollback()
+
+        logger.error(f"Error in handle_banner_refine: {e}")
+
+        import traceback
+        traceback.print_exc()
+
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500
+        )
+
+#Code for retail banner generation for different brand
+def generate_hero_banner_prompt_for_retail(
+    llm,
+    content: str,
+    aspect_ratio: str,
+    size_label: str,
+    intent: str,
+    brand_name: str = None,
+    has_logo: bool = False
+) -> str:
+    """
+    Generate a high-quality retail hero banner image prompt using LLM.
+    Designed for ecommerce campaigns (e.g., Christmas, Back to School, Sales).
+    """
+
+    layout_hint = LAYOUT_HINTS.get(aspect_ratio, LAYOUT_HINTS["16:9"])
+    intent_line = f"• Campaign intent: {intent}" if intent else ""
+
+    brand_line = f"• Brand: {brand_name}" if brand_name else ""
+
+    logo_line = "• Include a placeholder area for brand logo (top corner or subtle overlay)" if has_logo else ""
+
+    prompt = f"""
+You are an award-winning ecommerce creative director specialising in high-conversion retail hero banners for online platforms (Amazon, Flipkart, Shopify, brand websites).
+
+Your task: produce ONE highly detailed image-generation prompt for a premium retail hero banner.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CAMPAIGN CONTEXT (use fully):
+{content}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BANNER SPECS:
+• Aspect ratio : {aspect_ratio} ({size_label})
+• Layout       : {layout_hint}
+{intent_line}
+{brand_line}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RETAIL HERO BANNER PRINCIPLES — follow ALL strictly:
+
+1. HEADLINE (MANDATORY)
+- One bold, attention-grabbing headline (max 8–10 words)
+- Must reflect campaign theme + product value
+- Example styles: offer-driven, benefit-driven, seasonal
+- Placed prominently over image
+
+2. CAPTION (MANDATORY)
+- One concise supporting line
+- Reinforces value (discount, quality, lifestyle benefit)
+- Positioned directly below headline
+
+3. BACKGROUND IMAGE (MANDATORY)
+- Full-bleed, high-quality lifestyle or product-centric scene
+- Must reflect:
+  → product usage OR
+  → seasonal/campaign context (e.g., Christmas setup, school desk, summer beach)
+- Should feel aspirational and purchase-driven
+- No plain backgrounds, no abstract-only visuals
+
+4. PRODUCT VISIBILITY
+- Product must be clearly visible OR strongly implied in usage scene
+- Can include:
+  → hero product shot
+  → lifestyle usage (e.g., person using product naturally)
+
+5. TEXT OVERLAY DESIGN
+- Clean overlay (left/center aligned depending on layout)
+- Strong contrast using gradient overlay or soft shadow
+- No clutter
+
+6. PRODUCT GROUP EMPHASIS
+- Clearly include multiple school essentials:
+  → school bag
+  → notebooks
+  → stationery (pencils, erasers)
+  → uniform elements (tie, belt, shoes)
+- Products should be visible and identifiable in the scene
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VISUAL & QUALITY STANDARDS:
+
+• Ultra high-resolution, sharp ecommerce-quality output
+• Modern retail aesthetic (premium, aspirational, conversion-focused)
+• Lighting: bright, natural, high clarity
+• Colors:
+  - Follow brand palette if available
+  - Otherwise use max 3–4 harmonious retail colors
+• Typography:
+  - Clean sans-serif
+  - Bold headline, lighter supporting text
+• If humans present:
+  - Natural posture, realistic proportions
+  - No distortions, no extra limbs, no blur
+• Depth:
+  - Soft shadows, layered composition, foreground + background separation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMERCIAL BEST PRACTICES:
+
+• Emphasize:
+  - Offers (discounts, limited-time deals)
+  - Seasonal relevance
+  - Lifestyle aspiration
+• Ensure:
+  - Visual hierarchy drives attention to headline → product → CTA
+  - All text is grammatically correct and free of spelling errors
+• Avoid:
+  - Overcrowding
+  - Too many elements
+  - Generic stock feel
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT RULES:
+
+• Return ONLY the final image-generation prompt
+• No explanations, no markdown
+• Must include:
+  - Exact headline text
+  - Caption text
+  - Full background scene description
+  - Product placement description
+  - Lighting and color direction
+  - Aspect ratio: {aspect_ratio}
+  {logo_line}
+
+Generate the hero banner prompt now.
+"""
+    response = llm.invoke(prompt)
+    image_prompt = response.content.strip()
+    print(f"🎨 Hero banner prompt ({aspect_ratio} — {size_label}):\n{image_prompt[:300]}...")
+    return image_prompt
+
+async def retail_workflow_banner(campaign_type, brand_data, db: AsyncSession, output_folder=None,
+                  domain=None, user_id=None, user_name=None,
+                  transaction_uuid=None, input_folder=None, banner_options=None, workflow_meta=None):
+
+    print("\n🎨 Generating Hero Banner for retail content factory workflow...\n")
+
+    try:
+        import uuid
+        sys_type, sys_path = getOSpecifiers()
+        if sys_type == 'linux':
+            print("iam in linux")
+            hls_uploads_path =  "/apps/ebuddy/hls_uploads"
+        else:
+            print("iam in windows")
+            hls_uploads_path = os.path.join(os.getcwd(),"src", "hls_uploads") 
+
+        os.makedirs(hls_uploads_path, exist_ok=True)
+        uuid_path = os.path.join(hls_uploads_path, transaction_uuid)
+        input_folder = os.path.join(uuid_path, "input_folder")
+        output_folder = os.path.join(uuid_path, "output_folder")
+        
+        os.makedirs(input_folder, exist_ok=True)
+        os.makedirs(output_folder, exist_ok=True)
+
+        banner_options = banner_options or {}
+        size_str = banner_options.get("size", "16:9")
+        intent = banner_options.get('intent')
+        country = banner_options.get('country') 
+        brand_name = banner_options.get("brand_guidelines", "")
+
+        aspect_ratio, size_label = get_aspect_ratio(size_str)
+        print(f"📐 Aspect ratio: {aspect_ratio} ({size_label})")
+
+        # brand_name may be "Brand Name - color palette info"; extract just the name for logo lookup
+        brand_name_only = brand_name.split(' - ', 1)[0].strip() if brand_name else ''
+        logo_bytes, logo_mime = await get_brand_logo_bytes(brand_name_only, db) if brand_name_only else (None, '')
+        if logo_bytes:
+            print(f"🏷️  Brand logo loaded for '{brand_name_only}'")
+        else:
+            print(f"ℹ️  No brand logo — generating without logo")
+
+        CAMPAIGN_CONTENT_MAP = {
+            "Back to School": """
+            Back-to-school campaign focused on young school children (Grades KG to 8).
+
+            Target audience:
+            - Kids aged 4 to 14
+            - Parents shopping for school essentials
+
+            Products included:
+            - School bags (colorful, lightweight)
+            - School shoes (black formal)
+            - Notebooks and stationery
+            - Pencils, pens, erasers
+            - Compass boxes
+            - School uniforms
+            - Belts, ties, socks
+
+            STRICT EXCLUSIONS:
+            - No laptops
+            - No college or office setups
+            - No older teenagers
+
+            Visual direction:
+            - Show young school children in uniform
+            - Classroom or home study environment
+            - Bright, colorful, cheerful setup
+            - Multiple school items visible (bags, notebooks, stationery)
+
+            Messaging focus:
+            - School readiness
+            - Fun learning
+            - Smart shopping for essentials
+            - Value deals for parents
+
+            Regional context:
+            - Adapt visual elements and messaging to local {country} school culture
+            - Use region-appropriate uniforms, school settings, and seasonal context
+            - Consider local holidays and school calendar timing
+            """,
+
+            "Halloween": """
+        Halloween campaign focuses on spooky, fun, and festive shopping experiences.
+        Products include costumes, decorations, snacks, party supplies, and themed items.
+        Messaging should highlight excitement, creativity, and limited-time spooky deals.
+        Tone: playful, mysterious, and fun.
+        Common themes: trick-or-treat, spooky vibes, scary discounts, festive preparation.
+        """,
+
+            "Christmas": """
+        Christmas campaign emphasizes gifting, celebration, and holiday spirit.
+        Products include gifts, decorations, winter clothing, electronics, and toys.
+        Messaging should focus on giving, family, joy, and festive savings.
+        Tone: warm, emotional, and celebratory.
+        Common themes: holiday gifting, joy, togetherness, festive offers.
+        """
+        }
+
+        document_content = CAMPAIGN_CONTENT_MAP.get(campaign_type, "").format(country=country)
+
+        # Step 1: LLM generates image prompt
+        llm = await initialize_5o_mini_llm(
+            db=db,
+            domain='retail'
+        )
+        image_prompt = generate_hero_banner_prompt_for_retail(
+            llm, document_content, aspect_ratio, size_label,
+            intent=intent, brand_name="", has_logo=""
+        )
+
+        # Step 2: Gemini generates image
+        logo_bytes = None
+        image_data = await generate_banner_image(image_prompt, db, logo_bytes, logo_mime)
+        if not image_data:
+            raise ValueError("No image data returned from Gemini")
+
+        # Save file
+        os.makedirs(output_folder, exist_ok=True)
+
+        ratio_tag     = aspect_ratio.replace(':', 'x')
+        format_part   = campaign_type.replace(' ', '_')
+        base_filename = f"{format_part}_{ratio_tag}"
+
+        counter   = 1
+        file_name = f"{base_filename}.png"
+        file_path = os.path.join(output_folder, file_name)
+        while os.path.exists(file_path):
+            counter  += 1
+            file_name = f"{base_filename}_{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
+
+        image = Image.open(io.BytesIO(image_data))
+        image.save(file_path, 'PNG')
+        print(f"✅ Banner saved: {file_path}")
+
+        with open(file_path, 'rb') as f:
+            final_image_data = f.read()
+
+        return Response(
+            content=final_image_data,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "X-Transaction-UUID": str(transaction_uuid),
+                "Access-Control-Expose-Headers": "X-Transaction-UUID",
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Error in handle_banner: {e}")
+        print(f"❌ Hero banner generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500,
+        )
+    
+
+#Code for parsing guardrails and validating banner copy against them for multiple brands in retail context
+async def retail_workflow_banner_brands(
+    campaign_type,
+    brand_data,
+    output_folder=None,
+    domain=None,
+    user_id=None,
+    user_name=None,
+    transaction_uuid=None,
+    input_folder=None,
+    banner_options=None,
+    workflow_meta=None,
+    db: AsyncSession = None,
+):
+
+    print("\n🎨 Generating Hero Banner for each brand in retail content factory workflow...\n")
+    print(f"Received brand data: {brand_data}")
+
+    output_file_paths = []  # Collect all banner paths here
+
+    try:
+        import uuid
+        sys_type, sys_path = getOSpecifiers()
+        if sys_type == 'linux':
+            print("iam in linux")
+            hls_uploads_path =  "/apps/ebuddy/hls_uploads"
+        else:
+            print("iam in windows")
+            hls_uploads_path = os.path.join(os.getcwd(),"src", "hls_uploads") 
+
+        os.makedirs(hls_uploads_path, exist_ok=True)
+        uuid_path = os.path.join(hls_uploads_path, transaction_uuid)
+        input_folder = os.path.join(uuid_path, "input_folder")
+        output_folder = os.path.join(uuid_path, "output_folder")
+        
+        os.makedirs(input_folder, exist_ok=True)
+        os.makedirs(output_folder, exist_ok=True)
+
+        banner_options = banner_options or {}
+        size_str = banner_options.get("size", "16:9")
+        intent = banner_options.get('intent')
+        country = banner_options.get('country') 
+        brand_name = banner_options.get("brand_guidelines", "")
+
+        aspect_ratio, size_label = get_aspect_ratio(size_str)
+        print(f"brand data : {brand_data}")
+        print(f"📐 Aspect ratio: {aspect_ratio} ({size_label})")
+
+        logo_bytes, logo_mime = None, ''
+
+        CAMPAIGN_CONTENT_MAP = {
+            "Back to School": """
+            Back-to-school campaign focused on young school children (Grades KG to 8).
+
+            Target audience:
+            - Kids aged 4 to 14
+            - Parents shopping for school essentials
+
+            STRICT EXCLUSIONS:
+            - No laptops
+            - No college or office setups
+            - No older teenagers
+
+            Visual direction:
+            - Show young school children in uniform
+            - Classroom or home study environment
+            - Bright, colorful, cheerful setup
+            - Multiple school items visible (bags, notebooks, stationery)
+
+            Messaging focus:
+            - School readiness
+            - Fun learning
+            - Smart shopping for essentials
+            - Value deals for parents
+
+            Regional context:
+            - Adapt visual elements and messaging to local {country} school culture
+            - Use region-appropriate uniforms, school settings, and seasonal context
+            - Consider local holidays and school calendar timing
+            """,
+
+            "Halloween": """
+        Halloween campaign focuses on spooky, fun, and festive shopping experiences.
+        Products include costumes, decorations, snacks, party supplies, and themed items.
+        Messaging should highlight excitement, creativity, and limited-time spooky deals.
+        Tone: playful, mysterious, and fun.
+        Common themes: trick-or-treat, spooky vibes, scary discounts, festive preparation.
+        """,
+
+            "Christmas": """
+        Christmas campaign emphasizes gifting, celebration, and holiday spirit.
+        Products include gifts, decorations, winter clothing, electronics, and toys.
+        Messaging should focus on giving, family, joy, and festive savings.
+        Tone: warm, emotional, and celebratory.
+        Common themes: holiday gifting, joy, togetherness, festive offers.
+        """
+        }
+
+        document_content = CAMPAIGN_CONTENT_MAP.get(campaign_type, "").format(country=country)
+        llm = await initialize_5o_mini_llm(db=db, domain='retail')
+        for brand_obj in brand_data['brand_knowledge']:  # loop through all brands, remove [:2] to process all brands instead of just first 2
+            try:
+                ctx = {
+                    'name': brand_obj.get('brand_name'),
+                    'tone': brand_obj.get('tone'),
+                    'guardrails': brand_obj.get('guardrails'),
+                    'category': brand_obj.get('category'),
+                    'focus_intent': brand_obj.get('focus_intent'),
+                }
+
+                # Step 1: LLM generates image prompt
+                image_prompt, valid, violations = await asyncio.to_thread(
+                    generate_hero_banner_prompt_for_retail_with_brand,
+                    llm,
+                    document_content,
+                    aspect_ratio,
+                    size_label,
+                    intent,
+                    brand_context=ctx,
+                )
+
+                # Step 2: Gemini generates image
+                logo_bytes = None
+                image_data = await generate_banner_image(image_prompt, db, logo_bytes, logo_mime)
+                if not image_data:
+                    logger.info(f"No image data returned from Gemini for brand {ctx['name']}")
+                    continue  # Skip to next brand instead of failing entire workflow
+
+                # Save file
+                os.makedirs(output_folder, exist_ok=True)
+
+                # ratio_tag     = aspect_ratio.replace(':', 'x')
+                format_part   = campaign_type.replace(' ', '_')
+                base_filename = f"{ctx['name']}_{format_part}"
+
+                file_name = f"{base_filename}.png"
+                file_path = os.path.join(output_folder, file_name)
+
+                image = Image.open(io.BytesIO(image_data))
+                image.save(file_path, 'PNG')
+                print(f"✅ Banner saved: {file_path} for brand {ctx['name']}")
+
+                # Collect successful output path
+                output_file_paths.append(os.path.abspath(file_path))
+            except Exception as brand_e:
+                logger.error(f"Error processing brand {ctx['name']}: {brand_e}")
+                print(f"❌ Error processing brand {ctx['name']}: {brand_e}")
+                continue
+
+        # Save DB transaction
+        if user_id and transaction_uuid:
+            logger.info(f"Starting DB save for transaction {transaction_uuid} with output paths: {output_file_paths}")
+            try:
+                output_file_path_json = json.dumps(output_file_paths)  # Serialize all paths
+                wf = workflow_meta or {}
+                db.add(HLSTransaction(
+                    uuid=transaction_uuid,
+                    format_type='banner',
+                    input_file_paths='',
+                    output_file_path=output_file_path_json,
+                    created_by=str(user_id),
+                    created_person=str(user_name),
+                    domain=domain,
+                    is_workflow=bool(wf.get('is_workflow', False)),
+                    workflow_type=wf.get('workflow_type'),
+                    workflow_run_id=wf.get('workflow_run_id'),
+                    workflow_step_name=wf.get('workflow_step_name'),
+                ))
+                await db.commit()
+                print(f"✅ Transaction saved: {transaction_uuid}")
+            except Exception as db_error:
+                logger.error(f"Error saving transaction {transaction_uuid}: {db_error}")
+                await db.rollback()
+    except Exception as e:
+        logger.error(f"Error in retail_workflow_banner_brands: {e}")
+        print(f"❌ Retail workflow banner generation failed: {e}")
+
+        import traceback
+        traceback.print_exc()
+
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500,
+        )
+    
+
+def parse_guardrails(guardrails_text: str) -> dict:
+    """
+    Parse guardrails text into structured format.
+    
+    Splits guardrails by "Universal:" and "Brand:" markers, then by semicolons or newlines.
+    
+    Args:
+        guardrails_text: Guardrails as single string or newline-separated list
+    
+    Returns:
+        Dict with 'universal' and 'brand' keys, each containing list of rules
+    
+    Example:
+        >>> text = "Universal: No academic claims; No health claims. Brand: Avoid casual slang."
+        >>> rules = parse_guardrails(text)
+        >>> rules['universal']
+        ['No academic claims', 'No health claims']
+        >>> rules['brand']
+        ['Avoid casual slang']
+    """
+    try:
+        result = {'universal': [], 'brand': []}
+        
+        if not guardrails_text:
+            return result
+        
+        # Split by "Universal:" and "Brand:" markers
+        parts = guardrails_text.split('Brand:')
+        
+        # Extract universal guardrails
+        if len(parts) > 0:
+            universal_part = parts[0].replace('Universal:', '').strip()
+            if universal_part:
+                # Split by semicolon or newline
+                rules = [r.strip() for r in universal_part.replace('\n', ';').split(';') if r.strip()]
+                result['universal'] = rules
+        
+        # Extract brand guardrails
+        if len(parts) > 1:
+            brand_part = parts[1].strip()
+            if brand_part:
+                rules = [r.strip() for r in brand_part.replace('\n', ';').split(';') if r.strip()]
+                result['brand'] = rules
+        
+        return result
+    
+    except Exception as e:
+        logger.error(f"Error parsing guardrails: {e}")
+        return {'universal': [], 'brand': []}
+
+
+def validate_banner_guardrails(headline: str, caption: str, brand_context: dict) -> tuple:
+    """
+    Validate generated banner copy against brand guardrails.
+    
+    Checks headline and caption for potential guardrail violations using pattern matching.
+    
+    Args:
+        headline: Generated headline text
+        caption: Generated caption text
+        brand_context: Brand context dict from get_brand_context()
+    
+    Returns:
+        Tuple of (is_valid: bool, violations: List[str])
+        is_valid=True if no guardrails violated
+        violations: List of detected violations (empty if valid)
+    
+    Example:
+        >>> ctx = {
+        ...     'tone': 'Friendly, dependable',
+        ...     'guardrails': 'No academic/grade-improvement claims on stationery'
+        ... }
+        >>> headline = "Get Better Grades with Classmate Notebooks"
+        >>> caption = "Academic boost guaranteed"
+        >>> valid, violations = validate_banner_guardrails(headline, caption, ctx)
+        >>> valid
+        False
+        >>> 'academic' in str(violations).lower()
+        True
+    """
+    try:
+        violations = []
+        combined_text = f"{headline} {caption}".lower()
+        
+        if not brand_context or not brand_context.get('guardrails'):
+            logger.info("No guardrails defined for this brand")
+            return True, []
+        
+        # Parse guardrails
+        guardrails = parse_guardrails(brand_context.get('guardrails', ''))
+        all_rules = guardrails.get('universal', []) + guardrails.get('brand', [])
+        
+        # Common violation patterns
+        violation_patterns = {
+            'academic claims': ['academic', 'grades', 'score', 'marks', 'exam', 'performance improvement'],
+            'health claims': ['health', 'posture', 'orthopaedic', 'back pain', 'medical', 'cure', 'heal'],
+            'superlatives': ['best', 'greatest', 'only', 'perfect', 'ultimate', 'guaranteed', 'premium only'],
+            'unverified': ['proven', 'scientifically', 'research shows', 'studies show'],
+        }
+        
+        # Check for violation patterns
+        for pattern_name, keywords in violation_patterns.items():
+            if any(keyword in combined_text for keyword in keywords):
+                # Check if this pattern is mentioned in guardrails
+                for rule in all_rules:
+                    if pattern_name.lower() in rule.lower():
+                        violations.append(
+                            f"Potential violation: '{pattern_name}' detected. Rule: {rule}"
+                        )
+                        break
+        
+        is_valid = len(violations) == 0
+        return is_valid, violations
+    
+    except Exception as e:
+        logger.error(f"Error validating guardrails: {e}")
+        return True, [f"Validation error: {str(e)}"]
+
+
+def prepare_brand_tone_prompt(brand_context: dict) -> str:
+    """
+    Generate LLM system instructions based on brand tone and intent.
+    
+    Creates markdown-formatted instructions to be injected into LLM prompts.
+    
+    Args:
+        brand_context: Brand context dict from get_brand_context()
+    
+    Returns:
+        String with brand-specific system instructions for LLM prompt
+    
+    Example:
+        >>> ctx = {
+        ...     'name': 'Classmate',
+        ...     'tone': 'Friendly, dependable, student-first',
+        ...     'focus_intent': 'Everyday reliability for students',
+        ...     'category': 'Stationery'
+        ... }
+        >>> instructions = prepare_brand_tone_prompt(ctx)
+        >>> "Friendly, dependable" in instructions
+        True
+    """
+    try:
+        if not brand_context:
+            return ""
+        
+        brand_name = brand_context.get('name', 'Brand')
+        tone = brand_context.get('tone', '')
+        focus_intent = brand_context.get('focus_intent', '')
+        category = brand_context.get('category', '')
+        guardrails = brand_context.get('guardrails', '')
+        
+        instructions = ""
+        
+        if tone:
+            instructions += f"\n• Brand Tone: Write in a {tone} tone\n"
+        
+        if focus_intent:
+            instructions += f"• Campaign Focus: Emphasize {focus_intent}\n"
+        
+        if category:
+            instructions += f"• Product Category: {category}\n"
+        
+        if guardrails:
+            guardrails_dict = parse_guardrails(guardrails)
+            instructions += f"\n• STRICT GUARDRAILS — Do NOT violate:\n"
+            
+            for rule in guardrails_dict.get('universal', []):
+                instructions += f"  - {rule}\n"
+            
+            for rule in guardrails_dict.get('brand', []):
+                instructions += f"  - {rule}\n"
+        
+        return instructions
+    
+    except Exception as e:
+        logger.error(f"Error preparing brand tone prompt: {e}")
+        return ""
+
+
+def generate_hero_banner_prompt_for_retail_with_brand(
+    llm,
+    content: str,
+    aspect_ratio: str,
+    size_label: str,
+    intent: str,
+    brand_context: dict | None = None,
+    has_logo: bool = False
+) -> tuple:
+    """
+    Generate a retail hero banner prompt WITH BRAND GUIDELINES (NEW).
+    
+    Enhanced version of generate_hero_banner_prompt_for_retail() that integrates
+    brand tone, focus_intent, and guardrails into the LLM prompt.
+    Validates generated copy against brand guardrails.
+    
+    Args:
+        llm: Language model instance (e.g., initialize_5o_mini_llm())
+        content: Campaign content/context
+        aspect_ratio: Banner aspect ratio (e.g., "16:9", "1:1")
+        size_label: Human-readable size label (e.g., "Widescreen")
+        intent: Campaign intent from banner_options
+        brand_context: Brand context dict from get_brand_context() [NEW PARAM]
+        has_logo: Whether logo is available
+    
+    Returns:
+        Tuple of (image_prompt: str, is_valid: bool, violations: List[str])
+        - image_prompt: The generated image generation prompt for Gemini
+        - is_valid: Whether generated copy passes guardrail validation
+        - violations: List of guardrail violations (empty if valid)
+    
+    Example:
+        >>> brand_data = {'data': [{'brand_name': 'Classmate', ...}]}
+        >>> ctx = get_brand_context(brand_data, 'Classmate')
+        >>> llm = initialize_5o_mini_llm()
+        >>> prompt, valid, violations = generate_hero_banner_prompt_for_retail_with_brand(
+        ...     llm, "Back to school content", "16:9", "Widescreen", "Back to School", 
+        ...     brand_context=ctx, has_logo=True
+        ... )
+        >>> if not valid:
+        ...     print(f"Review violations: {violations}")
+    """
+    try:
+        layout_hint = LAYOUT_HINTS.get(aspect_ratio, LAYOUT_HINTS.get("16:9", "standard layout"))
+        intent_line = f"• Campaign intent: {intent}" if intent else ""
+        logo_line = "• Include a placeholder area for brand logo (top corner or subtle overlay)" if has_logo else ""
+        
+        # Build brand-aware instructions [NEW]
+        brand_instructions = ""
+        if brand_context:
+            brand_instructions = prepare_brand_tone_prompt(brand_context)
+            print(f"🏷️ Brand context loaded for: {brand_context.get('name', 'Unknown Brand')}")
+        
+        brand_name_display = brand_context.get('name', '') if brand_context else ""
+        brand_line = f"• Brand: {brand_name_display}" if brand_name_display else ""
+        
+        prompt = f"""
+You are an award-winning ecommerce creative director specialising in high-conversion retail promotional banners.
+Your task: produce ONE highly detailed image-generation prompt for a premium retail promotional banner.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CAMPAIGN CONTEXT (use fully):
+{content}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BANNER SPECS:
+• Aspect ratio : {aspect_ratio} ({size_label})
+• Layout       : {layout_hint}
+{intent_line}
+{brand_line}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BRAND-SPECIFIC GUIDELINES:
+{brand_instructions if brand_instructions else "• No specific brand guidelines provided"}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RETAIL PROMOTIONAL BANNER PRINCIPLES — follow ALL strictly:
+
+1. HEADLINE (MANDATORY)
+- One bold, attention-grabbing headline (max 8–10 words)
+- Must reflect campaign theme + product value
+- Must align with brand tone if provided
+- Placed prominently over image
+
+2. CAPTION (MANDATORY)
+- One concise supporting line reinforcing value
+- Positioned directly below headline
+
+3. BACKGROUND IMAGE (MANDATORY)
+- Full-bleed, high-quality lifestyle scene
+- Must reflect campaign context and brand identity
+
+4. QUALITY & GUARDRAILS
+- Ultra high-resolution, sharp ecommerce-quality output
+- If humans present: Natural posture, no distortions
+- All text grammatically correct and spelling error-free
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT RULES:
+
+• Return ONLY the final image-generation prompt
+• No explanations, no markdown
+• Must include: Exact headline, caption, background description, product placement, lighting, aspect ratio {aspect_ratio}
+{logo_line}
+
+Generate the hero banner prompt now.
+"""
+        
+        response = llm.invoke(prompt)
+        image_prompt = response.content.strip()
+        print(f"🎨 Hero banner prompt ({aspect_ratio} — {size_label}):\n{image_prompt[:300]}...")
+        
+        # Extract headline and caption for validation [NEW]
+        lines = image_prompt.split('\n')
+        headline = ""
+        caption = ""
+        
+        for i, line in enumerate(lines):
+            if len(line) > 10 and i < len(lines)-1:
+                headline = line.strip()
+                caption = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                break
+        
+        # Validate against guardrails [NEW]
+        is_valid = True
+        violations = []
+        if brand_context:
+            is_valid, violations = validate_banner_guardrails(
+                headline or image_prompt[:100],
+                caption or image_prompt[100:200],
+                brand_context
+            )
+            if violations:
+                print(f"⚠️  Guardrail validation: {len(violations)} warning(s)")
+                for v in violations[:3]:  # Print first 3
+                    print(f"   - {v}")
+            else:
+                print(f"✅ Banner copy passes all brand guardrails")
+        
+        return image_prompt, is_valid, violations
+    
+    except Exception as e:
+        logger.error(f"Error generating brand-aware banner prompt: {e}")
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return "", False, [str(e)]
+    
