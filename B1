@@ -1,1 +1,6 @@
+New-Item -ItemType Directory -Force -Path "C:\Users\ST127673\Ai_engineering_buddy\batch_process\src\hls_platform\assets\Templates" | Out-Null
+Copy-Item "C:\Users\ST127673\Ai_engineering_buddy\engg-buddy-ui-facelift\src\hls_src\assets\Templates\*" -Destination "C:\Users\ST127673\Ai_engineering_buddy\batch_process\src\hls_platform\assets\Templates\"
+Get-ChildItem "C:\Users\ST127673\Ai_engineering_buddy\batch_process\src\hls_platform\assets\Templates"
+
+
 C:\Users\ST127673\Ai_engineering_buddy\engg-buddy-ui-facelift\src\hls_src\assets\Templates
