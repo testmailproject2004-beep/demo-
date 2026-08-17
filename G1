@@ -1,1 +1,9 @@
-
+Modified (existing file, rewritten):
+engg-buddy-ui-facelift/src/hls_src/components/SalesBannerGenerator.tsx — replaced the old multi-recipient/fixed-template version with the template picker, photo swap, and prompt field
+Added (new file):
+batch_process/src/hls_platform/sales_banner.py — the actual generation logic: template lookup, Gemini image editing, retry/diagnostics, error handling
+Added (new folder, not code):
+batch_process/src/hls_platform/assets/Templates/ — the same 11 template images, copied over from the frontend's existing copy so the backend has its own source to edit from
+Confirmed — zero changes needed, on purpose:
+batch_process/src/routers/sales_content_factory_routes.py — already called the handler with the exact signature it needed
+engg-buddy-ui-facelift/src/hls_src/components/ConvertContent/SelectContentFormat.tsx — already wired the modal open/close correctly
