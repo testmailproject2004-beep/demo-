@@ -1,3 +1,9 @@
+Image model call failed: The model did not return an image. Try again, or simplify the instruction.
+
+2026-08-17 10:20:05 | unknown-service | INFO     | google_genai.models | AFC is enabled with max remote calls: 10. | trace_id=9c67e272 | span_id=f1b93331
+
+INFO:     127.0.0.1:0 - "POST /batch_process/sales_platform/banner/generate HTTP/1.1" 502 Bad Gateway
+
 """Sales Banner editor — business logic for the "Banner Generator" modal.
 
 FIX APPLIED: `sales_content_factory_routes.py` calls this as
@@ -345,4 +351,3 @@ async def sales_banner_generate_handler(request: Request, db: AsyncSession) -> R
         logger.error(f"Error in sales_banner_generate_handler: {e}")
         traceback.print_exc()
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
-
