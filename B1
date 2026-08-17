@@ -1,1 +1,723 @@
+C:\Users\ST127673\Ai_engineering_buddy\batch_process\src\hls_platform\sales_presentation_plus.py
+
+import json
+import os
+import uuid
+import tempfile
+from typing import Dict, Any, List
+
+from ..hls_platform.utils import initialize_llm, update_user_budget_and_log
+from ..hls_platform.presentation_engine import create_dynamic_pptx
+
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
+from pptx.enum.shapes import MSO_SHAPE
+
+from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..repository.zenseai_content_factory_repo import upsert_hls_sales_presentation_plus_transaction
+
+
+# ══════════════════════════════════════════════════════════════════
+#  LAYOUT GRID  (Widescreen 16:9 → 13.333″ × 7.5″)
+# ══════════════════════════════════════════════════════════════════
+W  = Inches(13.333)   
+H  = Inches(7.5)      
+
+ML = Inches(0.8)      
+MR = Inches(0.8)      
+MT = Inches(0.6)      
+
+FOOTER_H   = Inches(0.4)    
+FOOTER_Y   = H - FOOTER_H   
+
+TITLE_Y    = Inches(0.5)    
+TITLE_H    = Inches(0.9)    
+BODY_Y     = TITLE_Y + TITLE_H + Inches(0.1)
+BODY_H     = FOOTER_Y - BODY_Y - Inches(0.2)
+BODY_W     = W - ML - MR
+
+# ══════════════════════════════════════════════════════════════════
+#  COLOR PARSER
+# ══════════════════════════════════════════════════════════════════
+def hex_to_rgb(hex_str: str) -> RGBColor:
+    """Convert #RRGGBB to RGBColor. Fallback to grey if invalid."""
+    try:
+        hex_str = hex_str.lstrip('#')
+        r = int(hex_str[0:2], 16)
+        g = int(hex_str[2:4], 16)
+        b = int(hex_str[4:6], 16)
+        return RGBColor(r, g, b)
+    except Exception:
+        return RGBColor(128, 128, 128)
+
+# ══════════════════════════════════════════════════════════════════
+#  PRIMITIVE SHAPE / TEXT HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def _rect(slide, left, top, width, height, color, border_color=None):
+    sh = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, int(left), int(top), int(width), int(height))
+    sh.fill.solid()
+    sh.fill.fore_color.rgb = color
+    if border_color:
+        sh.line.color.rgb = border_color
+        sh.line.width = Pt(0.75)
+    else:
+        sh.line.fill.background()
+    return sh
+
+def _txt(slide, left, top, width, height, text, size, color, bold=False, font="Segoe UI", align=PP_ALIGN.LEFT, wrap=True):
+    txb = slide.shapes.add_textbox(int(left), int(top), int(width), int(height))
+    tf = txb.text_frame
+    tf.word_wrap = wrap
+    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+    p = tf.paragraphs[0]
+    p.alignment = align
+    run = p.add_run()
+    run.text = text
+    run.font.name = font
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = color
+    return txb
+
+def _notes(slide, slide_data):
+    txt = slide_data.get("speaker_notes", "")
+    if txt:
+        slide.notes_slide.notes_text_frame.text = txt
+
+
+# ══════════════════════════════════════════════════════════════════
+#  COMMON STRUCTURAL LAYERS
+# ══════════════════════════════════════════════════════════════════
+
+def _draw_base(slide, theme, slide_type="light"):
+    if slide_type == "dark":
+        _rect(slide, 0, 0, W, H, theme["primary"])
+        _rect(slide, 0, 0, W, Inches(0.15), theme["accent"])
+        _rect(slide, 0, FOOTER_Y, W, FOOTER_H, theme["primary_l"])
+    else:
+        _rect(slide, 0, 0, W, H, theme["bg_alt"])
+        _rect(slide, 0, 0, W, Inches(0.15), theme["accent"])
+        _rect(slide, 0, FOOTER_Y, W, FOOTER_H, theme["bg_card"])
+
+def _slide_num(slide, theme, num, total, slide_type="light"):
+    color = theme["text_l"] if slide_type == "dark" else theme["text_m"]
+    _txt(slide, Inches(11.9), FOOTER_Y + Inches(0.10), Inches(1.1), Inches(0.26), f"{num} / {total}", 10, color, align=PP_ALIGN.RIGHT, wrap=False, font=theme["font"])
+
+def _title_row(slide, theme, text, slide_type="light"):
+    color = theme["text_l"] if slide_type == "dark" else theme["primary"]
+    _txt(slide, ML, TITLE_Y, BODY_W, TITLE_H, text, 34, color, bold=True, font=theme["font"])
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DYNAMIC LAYOUT BUILDERS
+# ══════════════════════════════════════════════════════════════════
+
+def _build_title(prs, sd, theme, total):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _draw_base(slide, theme, "dark")
+
+    _txt(slide, ML, Inches(2.05), Inches(10.0), Inches(2.1), sd.get("title", "Presentation"), 46, theme["text_l"], bold=True, font=theme["font"])
+    _rect(slide, ML, Inches(4.28), Inches(3.2), Inches(0.055), theme["accent"])
+    
+    sub = sd.get("subtitle", "")
+    if sub:
+        _txt(slide, ML, Inches(4.42), Inches(10.0), Inches(1.1), sub, 21, theme["accent"], font=theme["font"])
+
+    _notes(slide, sd)
+
+
+def _build_standard_bullets(prs, sd, theme, total):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _draw_base(slide, theme, "light")
+    _title_row(slide, theme, sd.get("title", ""), "light")
+    _slide_num(slide, theme, sd.get("slide_number", 0), total, "light")
+    
+    bullets = sd.get("bullet_points", sd.get("content", sd.get("bullets", [])))[:6]
+    if not bullets:
+        _notes(slide, sd)
+        return
+        
+    card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, int(ML), int(BODY_Y), int(BODY_W), int(BODY_H))
+    card.fill.solid()
+    card.fill.fore_color.rgb = theme["bg_card"]
+    card.line.fill.background()
+    
+    tf = card.text_frame
+    tf.word_wrap = True
+    tf.margin_left = tf.margin_right = Inches(0.6)
+    tf.margin_top = Inches(0.5)
+    
+    for i, pt in enumerate(bullets):
+        p = tf.add_paragraph() if i > 0 else tf.paragraphs[0]
+        p.text = f"•  {pt}"
+        p.space_before = Pt(16)
+        p.font.name = theme["font"]
+        p.font.size = Pt(20)
+        p.font.color.rgb = theme["text_d"]
+        p.alignment = PP_ALIGN.LEFT
+        
+    _notes(slide, sd)
+
+
+def _build_process_flowchart(prs, sd, theme, total):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _draw_base(slide, theme, "light")
+    _title_row(slide, theme, sd.get("title", ""), "light")
+    _slide_num(slide, theme, sd.get("slide_number", 0), total, "light")
+    
+    nodes = sd.get("nodes", sd.get("steps", sd.get("content", [])))[:5]
+    if not nodes:
+        _notes(slide, sd)
+        return
+        
+    n = len(nodes)
+    gap = Inches(0.4)
+    box_w = int((BODY_W - (gap * (n - 1))) / max(n, 1))
+    box_h = Inches(1.8)
+    cy = int(BODY_Y + (BODY_H - box_h) / 2)
+    
+    for i, node_text in enumerate(nodes):
+        cx = int(ML + i * (box_w + gap))
+        
+        shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, cx, cy, box_w, box_h)
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = theme["primary"]
+        shape.line.fill.background()
+        
+        tf = shape.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.text = f"STEP {i+1}"
+        p.font.size = Pt(12)
+        p.font.color.rgb = theme["accent"]
+        p.font.bold = True
+        p.font.name = theme["font"]
+        p.alignment = PP_ALIGN.CENTER
+        
+        p2 = tf.add_paragraph()
+        p2.text = node_text
+        p2.font.size = Pt(16)
+        p2.font.color.rgb = theme["text_l"]
+        p2.font.name = theme["font"]
+        p2.space_before = Pt(8)
+        p2.alignment = PP_ALIGN.CENTER
+        
+        if i < n - 1:
+            arr_x = cx + box_w + Inches(0.05)
+            arr_y = cy + int(box_h / 2) - Inches(0.1)
+            arr = slide.shapes.add_shape(MSO_SHAPE.RIGHT_ARROW, int(arr_x), int(arr_y), int(gap - Inches(0.1)), int(Inches(0.2)))
+            arr.fill.solid()
+            arr.fill.fore_color.rgb = theme["accent"]
+            arr.line.fill.background()
+            
+    _notes(slide, sd)
+
+
+def _build_comparison_table(prs, sd, theme, total):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _draw_base(slide, theme, "light")
+    _title_row(slide, theme, sd.get("title", ""), "light")
+    _slide_num(slide, theme, sd.get("slide_number", 0), total, "light")
+    
+    headers = sd.get("table_headers", sd.get("headers", []))
+    rows = sd.get("table_rows", sd.get("rows", []))
+    if not headers or not rows:
+        # Fallback if LLM just outputs "content"
+        content = sd.get("content", [])
+        if len(content) > 1:
+            headers = content[0]
+            rows = content[1:]
+        else:
+            _notes(slide, sd)
+            return
+        
+    cols = len(headers)
+    num_rows = len(rows) + 1
+    
+    shape = slide.shapes.add_table(num_rows, cols, int(ML), int(BODY_Y), int(BODY_W), int(BODY_H))
+    table = shape.table
+    
+    for i, h in enumerate(headers):
+        cell = table.cell(0, i)
+        cell.text = str(h)
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = theme["primary"]
+        for p in cell.text_frame.paragraphs:
+            p.font.color.rgb = theme["text_l"]
+            p.font.size = Pt(16)
+            p.font.bold = True
+            p.font.name = theme["font"]
+            
+    for r_idx, r_data in enumerate(rows):
+        for c_idx, cell_val in enumerate(r_data):
+            if c_idx < cols:
+                cell = table.cell(r_idx + 1, c_idx)
+                cell.text = str(cell_val)
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = theme["bg_alt"] if r_idx % 2 == 0 else theme["bg_card"]
+                for p in cell.text_frame.paragraphs:
+                    p.font.color.rgb = theme["text_d"]
+                    p.font.size = Pt(15)
+                    p.font.name = theme["font"]
+                    
+    _notes(slide, sd)
+
+
+def _build_architecture_diagram(prs, sd, theme, total):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _draw_base(slide, theme, "light")
+    _title_row(slide, theme, sd.get("title", ""), "light")
+    _slide_num(slide, theme, sd.get("slide_number", 0), total, "light")
+    
+    layers = sd.get("layers", [])[:4]
+    if not layers:
+        _notes(slide, sd)
+        return
+        
+    n = len(layers)
+    gap = Inches(0.4)
+    layer_h = int((BODY_H - (gap * (n - 1))) / max(n, 1))
+    
+    for i, layer_text in enumerate(layers):
+        ly = int(BODY_Y + i * (layer_h + gap))
+        
+        shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, int(ML), ly, int(BODY_W), layer_h)
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = theme["primary_l"]
+        shape.line.fill.background()
+        
+        tf = shape.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.text = layer_text
+        p.font.size = Pt(22)
+        p.font.color.rgb = theme["text_l"]
+        p.font.bold = True
+        p.font.name = theme["font"]
+        p.alignment = PP_ALIGN.CENTER
+
+    _notes(slide, sd)
+
+
+def _build_closing(prs, sd, theme, total):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _draw_base(slide, theme, "dark")
+
+    _txt(slide, ML, int(H * 0.35), BODY_W, Inches(1), sd.get("title", "Thank You"), 48, theme["text_l"], bold=True, font=theme["font"], align=PP_ALIGN.CENTER)
+    
+    cta = sd.get("cta", "")
+    if cta:
+        _txt(slide, ML, int(H * 0.55), BODY_W, Inches(0.5), cta, 24, theme["accent"], font=theme["font"], align=PP_ALIGN.CENTER)
+
+    _notes(slide, sd)
+
+
+_BUILDERS = {
+    "title":         _build_title,
+    "standard_bullets": _build_standard_bullets,
+    "process_flowchart": _build_process_flowchart,
+    "comparison_table": _build_comparison_table,
+    "architecture_diagram": _build_architecture_diagram,
+    "closing":       _build_closing,
+}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  LLM CHAIN & PRESENTATION CREATION
+# ══════════════════════════════════════════════════════════════════
+
+def parse_llm_json(resp, log_msg=""):
+    text = resp.content.strip()
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0].strip()
+    try:
+        return json.loads(text), text
+    except json.JSONDecodeError as e:
+        print(f"JSON Parsing Error {log_msg}: {text}")
+        raise ValueError(f"LLM returned invalid JSON {log_msg}: {e}")
+
+def run_design_director(llm, file_content, user_vibe):
+    prompt = f"""You are an elite Presentation Design Director.
+Analyze the following source content and STRICTLY FOLLOW the user's design vibe request to create a cohesive Color Theme.
+
+USER VIBE REQUEST: {user_vibe}
+
+CRITICAL: If the user requests subtle or non-punchy colors, use sophisticated, muted hex codes. If they request corporate colors, use professional, balanced colors. You MUST adapt the colors perfectly to the user vibe request.
+CRITICAL: DO NOT always use "bordered" layout or green shades. Vary the "layout_style" randomly between "minimal", "floating", and "bordered". If the vibe is modern/techy, strongly prefer "minimal" or "floating". DO NOT default to green unless requested!
+
+SOURCE CONTENT SNIPPET:
+{file_content[:3000]}
+
+OUTPUT FORMAT: Return STRICT JSON ONLY.
+{{
+  "theme": {{
+    "primary": "#HEX",
+    "primary_l": "#HEX",
+    "secondary": "#HEX",
+    "accent": "#HEX",
+    "text_d": "#HEX",
+    "text_l": "#FFFFFF",
+    "text_m": "#HEX",
+    "bg_alt": "#HEX",
+    "bg_card": "#HEX",
+    "font": "Segoe UI",
+    "layout_style": "minimal"
+  }},
+  "design_strategy": "Explain your choices in one sentence, including why you picked this layout style (minimal, bordered, or floating)."
+}}
+"""
+    resp = llm.invoke(prompt)
+    data, _ = parse_llm_json(resp, "in Design Director")
+    
+    tokens = resp.response_metadata.get("token_usage", {})
+    return data, tokens.get("prompt_tokens", 0), tokens.get("completion_tokens", 0)
+
+def run_content_generator(llm, file_content, design_strategy, slide_count):
+    # Extract the max slide count if a range is provided
+    target_count = slide_count
+    if "-" in slide_count:
+        target_count = slide_count.split("-")[-1].strip()
+        
+    prompt = f"""You are an elite Presentation Copywriter, Data Analyst, and Vector Graphic Designer.
+You MUST generate EXACTLY {target_count} slides based on the source content. DO NOT generate fewer than {target_count} slides. Capture ALL rich data from the source to fill every slide.
+Use the design strategy as context.
+
+SOURCE CONTENT:
+{file_content}
+
+DESIGN STRATEGY:
+{json.dumps(design_strategy)}
+
+═══════════════════════════════════════════════════
+CONTENT QUALITY RULES — READ CAREFULLY
+═══════════════════════════════════════════════════
+A. VERBOSE CONTENT: Every bullet point must be a COMPLETE, DESCRIPTIVE sentence of at least 25 words. Do NOT use vague labels like "Point 1", "Key Feature", or single-word entries.
+B. RICH DESCRIPTIONS: In feature_grid, each "description" must be 3–4 full sentences explaining the feature's value, how it works, and its impact. It MUST fill vertical space!
+C. RICH MILESTONES: In timeline, each "description" must be 2–3 full sentences describing what happened or what is planned.
+D. RICH ARCHITECTURE: In architecture_diagram, each layer must include an "items" array listing 3–6 sub-components or technologies in that layer.
+E. TWO COLUMN: For "two_column" slides, kpi_value should be a compelling metric or short quote (max 8 words), kpi_desc should be 3–4 sentences of rich context.
+F. EXACT BULLET COUNT & LENGTH: You MUST generate EXACTLY 4-5 bullet points for "standard_bullets" slides. For "two_column" slides, you MUST generate EXACTLY 2-3 bullet points to prevent text overflow in the narrow column. For "feature_grid" and "process_flowchart", descriptions MUST be extremely brief (max 1 sentence, under 15 words) because the boxes are very small. For "pros_cons", limit to exactly 2-3 pros and 2-3 cons.
+G. RICH FLOWCHART: In process_flowchart, if there are only 2 or 3 steps, provide a much longer, multi-sentence "description" for each step (at least 3-4 sentences) to fill the large visual boxes.
+H. ONE-LINE TITLES: EVERY slide title, including the main presentation title, MUST be extremely short and punchy, fitting on exactly one line (maximum 6 words). Do NOT generate long, multi-line titles for any slide.
+I. DIVERSE LAYOUTS: You MUST use a diverse mix of visual slide types (process_flowchart, architecture_diagram, feature_grid, timeline, pros_cons, quote_slide). Do NOT just output text bullets. Make the presentation highly visual.
+J. PROS & CONS CAUTION: Only use the "pros_cons" slide type if you find a very strong reason and exact pros/cons in the source material. Not all presentations need one. Do NOT use it just for the sake of variety.
+
+═══════════════════════════════════════════════════
+SLIDE TYPE RULES
+═══════════════════════════════════════════════════
+1. First slide MUST be "title". DO NOT use "title" for any other slide.
+2. Last slide MUST be "closing". DO NOT use "closing" for any other slide.
+3. Other slides must be one of: "standard_bullets", "process_flowchart", "comparison_table", "architecture_diagram", "feature_grid", "timeline", "data_chart", "two_column", "pros_cons", "quote_slide". Do NOT use "infographic_canvas".
+4. Use "two_column" for slides with a key metric/stat/quote on the left and a detailed bullet list on the right (e.g. "Key Numbers", "Why It Matters", "Our Results").
+
+═══════════════════════════════════════════════════
+CUSTOM SHAPES (Vector Drawing Rules)
+═══════════════════════════════════════════════════
+- You can add an optional "custom_shapes" array to ANY slide (EXCEPT "title", "closing", "data_chart").
+- Canvas: Width=13.33 inches, Height=7.5 inches. Body area: Left=0.8, Top=1.6, Right≤12.5, Bottom≤7.0.
+- Shape types: RECTANGLE, ROUNDED_RECTANGLE, OVAL, ISOSCELES_TRIANGLE, RIGHT_ARROW, LEFT_ARROW, UP_ARROW, DOWN_ARROW.
+- Colors: primary, primary_l, secondary, accent, text_d, text_l, text_m, bg_alt, bg_card.
+
+ARROW SPACING RULE (CRITICAL): Arrows MUST have a 0.2-inch gap on EACH SIDE from the boxes they connect.
+  The arrow's Left = box_right + 0.2, and arrow's Width = gap_between_boxes - 0.4 (to leave 0.2 on each side).
+
+3-BLOCK FLOW (Top=2.5, Block Height=1.8):
+  Block 1: Left=1.0, Width=3.0  →  Arrow 1: Left=4.2, Width=1.0  →  Block 2: Left=5.4, Width=3.0
+  Arrow 2: Left=8.6, Width=1.0  →  Block 3: Left=9.8, Width=3.0 (ends at 12.8, safe!)
+
+4-BLOCK FLOW (Top=2.5, Block Height=1.8):
+  Block 1: Left=0.5, Width=2.5  →  Arrow 1: Left=3.2, Width=0.4  →  Block 2: Left=3.8, Width=2.5
+  Arrow 2: Left=6.5, Width=0.4  →  Block 3: Left=7.1, Width=2.5
+  Arrow 3: Left=9.8, Width=0.4  →  Block 4: Left=10.4, Width=2.5 (ends at 12.9, safe!)
+
+5-6-BLOCK FLOW — USE 2 ROWS (Row 1 Top=1.8, Row 2 Top=4.5, Block Height=1.6):
+  ROW 1: Block 1: Left=1.0, W=3.0 | Arrow: Left=4.2, W=1.0 | Block 2: Left=5.4, W=3.0 | Arrow: Left=8.6, W=1.0 | Block 3: Left=9.8, W=3.0
+  ROW 2: Block 4: Left=1.0, W=3.0 | Arrow: Left=4.2, W=1.0 | Block 5: Left=5.4, W=3.0 | Arrow: Left=8.6, W=1.0 | Block 6: Left=9.8, W=3.0
+
+═══════════════════════════════════════════════════
+OUTPUT FORMAT — STRICT JSON ONLY
+═══════════════════════════════════════════════════
+Return ONLY valid JSON. Make sure "slides" has EXACTLY {target_count} elements.
+{{
+  "presentation_metadata": {{"title": "...", "total_slides": {slide_count}}},
+  "slides": [
+    {{ "slide_number": 1, "slide_type": "title", "title": "...", "subtitle": "...", "speaker_notes": "...", "custom_shapes": [] }},
+    {{ "slide_number": 2, "slide_type": "standard_bullets", "title": "...", "bullet_points": ["Full sentence bullet with at least 20 words explaining the point in detail with context.", "Second full sentence bullet expanding on a different aspect of the topic.", "Third bullet going deep into specifics and implications.", "Fourth bullet providing another critical insight or data point.", "Fifth bullet concluding the slide with a strong takeaway."], "speaker_notes": "..." }},
+    {{ "slide_number": 3, "slide_type": "two_column", "title": "...", "kpi_label": "Key Metric", "kpi_value": "94%", "kpi_desc": "Two to three sentences of context explaining this metric, why it matters, and what it means for the business.", "bullet_points": ["Full sentence detail about point 1.", "Full sentence detail about point 2."], "speaker_notes": "..." }},
+    {{ "slide_number": 4, "slide_type": "feature_grid", "title": "...", "features": [{{"header": "Feature Name", "description": "One very short sentence (max 15 words) explaining the feature."}}], "speaker_notes": "..." }},
+    {{ "slide_number": 5, "slide_type": "process_flowchart", "title": "...", "nodes": [{{"title": "Step 1", "description": "Extremely brief overview (max 10 words)."}}, {{"title": "Step 2", "description": "Extremely brief overview (max 10 words)."}}, {{"title": "Step 3", "description": "Extremely brief overview (max 10 words)."}}], "speaker_notes": "..." }},
+    {{ "slide_number": 6, "slide_type": "pros_cons", "title": "...", "pros": ["Clear advantage one.", "Significant benefit two."], "cons": ["Potential drawback one.", "Cost implication two."], "speaker_notes": "..." }},
+    {{ "slide_number": 7, "slide_type": "architecture_diagram", "title": "...", "layers": [{{"title": "Presentation Layer", "items": ["React UI", "Angular Dashboard", "Mobile App"]}}], "speaker_notes": "..." }},
+    {{ "slide_number": 9, "slide_type": "timeline", "title": "...", "milestones": [{{"date": "Q1 2024", "description": "Full sentence describing what was achieved or is planned for this milestone period and its significance."}}], "speaker_notes": "..." }},
+    {{ "slide_number": 10, "slide_type": "data_chart", "title": "...", "chart_type": "bar", "data_points": [{{"label": "Metric A", "value": 75}}, {{"label": "Metric B", "value": 90}}], "speaker_notes": "..." }},
+    {{ "slide_number": 11, "slide_type": "closing", "title": "Thank You", "cta": "Contact us at example@company.com", "speaker_notes": "..." }}
+  ]
+}}
+"""
+
+    resp = llm.invoke(prompt)
+    data, _ = parse_llm_json(resp, "in Content Generator")
+    
+    tokens = resp.response_metadata.get("token_usage", {})
+    return data, tokens.get("prompt_tokens", 0), tokens.get("completion_tokens", 0)
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN ENTRYPOINT
+# ══════════════════════════════════════════════════════════════════
+
+def get_palette(palette_name: str) -> Dict:
+    palettes = {
+        "Corporate Slate": {
+            "primary": "#2C3E50", "primary_l": "#34495E", "secondary": "#5D6D7E",
+            "accent": "#3498DB", "text_d": "#2C3E50", "text_l": "#FFFFFF", 
+            "text_m": "#7F8C8D", "bg_alt": "#F8F9F9", "bg_card": "#EAECEE", "font": "Segoe UI", "layout_style": "bordered"
+        },
+        "Ocean Blue": {
+            "primary": "#005F86", "primary_l": "#0077A6", "secondary": "#00A8CC",
+            "accent": "#00D4FF", "text_d": "#005F86", "text_l": "#FFFFFF", 
+            "text_m": "#52798F", "bg_alt": "#EAF4F4", "bg_card": "#CCE3DE", "font": "Segoe UI", "layout_style": "floating"
+        },
+        "Neon Cyber": {
+            "primary": "#1F2833", "primary_l": "#2B3642", "secondary": "#45A29E",
+            "accent": "#66FCF1", "text_d": "#C5C6C7", "text_l": "#FFFFFF", 
+            "text_m": "#8A8D91", "bg_alt": "#2B3642", "bg_card": "#3C4A5A", "font": "Segoe UI", "layout_style": "minimal"
+        },
+        "Earth Tones": {
+            "primary": "#456150", "primary_l": "#5A7C66", "secondary": "#A38B76",
+            "accent": "#D19C4C", "text_d": "#456150", "text_l": "#FFFFFF", 
+            "text_m": "#7A8780", "bg_alt": "#F3F1ED", "bg_card": "#E5E1D8", "font": "Segoe UI", "layout_style": "bordered"
+        },
+        "Sunset Vibrant": {
+            "primary": "#57167E", "primary_l": "#7B1FA2", "secondary": "#9B3192",
+            "accent": "#EA5F89", "text_d": "#57167E", "text_l": "#FFFFFF", 
+            "text_m": "#7B558C", "bg_alt": "#FFF0F5", "bg_card": "#FFE6F0", "font": "Segoe UI", "layout_style": "floating"
+        },
+        "Mint Elegance": {
+            "primary": "#2D6A4F", "primary_l": "#40916C", "secondary": "#52B788",
+            "accent": "#74C69D", "text_d": "#2D6A4F", "text_l": "#FFFFFF", 
+            "text_m": "#52796F", "bg_alt": "#EAF4F0", "bg_card": "#D8F3DC", "font": "Segoe UI", "layout_style": "bordered"
+        },
+        "Ruby Minimalist": {
+            "primary": "#6A040F", "primary_l": "#9D0208", "secondary": "#D00000",
+            "accent": "#DC2F02", "text_d": "#6A040F", "text_l": "#FFFFFF", 
+            "text_m": "#6A040F", "bg_alt": "#FFF0F0", "bg_card": "#FFE0E0", "font": "Segoe UI", "layout_style": "minimal"
+        },
+        "Midnight Purple": {
+            "primary": "#240046", "primary_l": "#3C096C", "secondary": "#5A189A",
+            "accent": "#7B2CBF", "text_d": "#240046", "text_l": "#FFFFFF", 
+            "text_m": "#3C096C", "bg_alt": "#F5E6FF", "bg_card": "#EBD4FF", "font": "Segoe UI", "layout_style": "floating"
+        },
+        "Golden Hour": {
+            "primary": "#720026", "primary_l": "#9B0034", "secondary": "#CE4257",
+            "accent": "#FF7F51", "text_d": "#720026", "text_l": "#FFFFFF", 
+            "text_m": "#720026", "bg_alt": "#FFF5E6", "bg_card": "#FFEDCC", "font": "Segoe UI", "layout_style": "bordered"
+        },
+        "Glacier Tech": {
+            "primary": "#04395E", "primary_l": "#0A5C94", "secondary": "#70A9A1",
+            "accent": "#9BC53D", "text_d": "#04395E", "text_l": "#FFFFFF", 
+            "text_m": "#04395E", "bg_alt": "#F2F5F8", "bg_card": "#E5E9ED", "font": "Segoe UI", "layout_style": "minimal"
+        }
+    }
+    return palettes.get(palette_name, palettes["Corporate Slate"])
+
+
+async def handle_sales_presentation_plus(
+    db: AsyncSession,
+    combined_content,
+    format_type,
+    output_folder,
+    downloaded_files,
+    domain,
+    user_id=None,
+    user_name=None,
+    transaction_uuid=None,
+    input_folder=None,
+    presentation_options=None,
+    workflow_meta=None,
+    status_callback=None
+):
+    try:
+        print(f"\n[Presentation +] 🚀 Starting generation for user_id={user_id}, format={format_type}")
+        llm = await initialize_llm(db, domain)
+        if not llm:
+            return JSONResponse(
+                content={"error": "Failed to initialize LLM"},
+                status_code=500
+            )
+
+        opts = presentation_options or {}
+        slide_count = opts.get("slide_count", "8-10")
+
+        # Determine Color Strategy
+        color_strategy = opts.get("color_strategy", "ai")
+        # Legacy fallback if they haven't refreshed frontend
+        if color_strategy == "ai" and opts.get("ai_theme") is False:
+            color_strategy = "palette"
+
+        design_vibe = opts.get("design_vibe", "Sleek, modern tech presentation with high contrast")
+        palette_name = opts.get("palette", "Corporate Slate")
+
+        logo_base64 = opts.get("logo_base64")
+        logo_opacity = int(opts.get("logo_opacity", 100))
+        logo_position = opts.get("logo_position", "top-right")
+        footer_text = opts.get("footer_text", "").strip()
+
+        logo_bytes = None
+        if logo_base64:
+            try:
+                import base64
+                from io import BytesIO
+                from PIL import Image
+
+                if "," in logo_base64:
+                    logo_base64 = logo_base64.split(",")[1]
+
+                img_data = base64.b64decode(logo_base64)
+                img = Image.open(BytesIO(img_data)).convert("RGBA")
+
+                if logo_opacity < 100:
+                    alpha = img.split()[3]
+                    alpha = alpha.point(lambda p: p * (logo_opacity / 100.0))
+                    img.putalpha(alpha)
+
+                buffer = BytesIO()
+                img.save(buffer, format="PNG")
+                logo_bytes = buffer
+            except Exception as e:
+                print(f"[Presentation +] Failed to process logo: {e}")
+
+        input_tokens = 0
+        output_tokens = 0
+
+        # 1. Design Strategy
+        if status_callback:
+            await status_callback("🎨 Generating design strategy & layout...")
+
+        print(f"[Presentation +] Generating Design Strategy (color_strategy={color_strategy})...")
+        if color_strategy in ["ai", "custom", "vibe"]:
+            if color_strategy == "ai":
+                vibe_prompt = "Create the optimal colors based on the context of this presentation."
+            else:
+                vibe_prompt = f"Story/Vibe Instructions: {design_vibe}\nBase Palette Guidance: {palette_name}"
+
+            design_data, dt_in, dt_out = run_design_director(llm, combined_content, vibe_prompt)
+            input_tokens += dt_in
+            output_tokens += dt_out
+        else:
+            design_data = {
+                "theme": get_palette(palette_name),
+                "design_strategy": f"Selected palette: {palette_name}"
+            }
+            print(f"[Presentation +] Using legacy palette: {palette_name}")
+
+        # 2. Content Generation
+        if status_callback:
+            await status_callback("📝 Crafting presentation narrative...")
+
+        print(f"[Presentation +] Generating Slide Content ({slide_count} slides)...")
+        content_data, ct_in, ct_out = run_content_generator(llm, combined_content, design_data, slide_count)
+        input_tokens += ct_in
+        output_tokens += ct_out
+
+        # Calculate cost for gpt-4o-mini: $0.150/1M input, $0.600/1M output
+        total_cost = (input_tokens / 1000000.0) * 0.150 + (output_tokens / 1000000.0) * 0.600
+
+        # Inject styling metadata
+        design_data["logo_bytes"] = logo_bytes
+        design_data["logo_position"] = logo_position
+        design_data["footer_text"] = footer_text
+
+        # 3. Create PPTX using the new engine
+        if status_callback:
+            await status_callback("⚙️ Rendering PPTX file (this may take a few moments)...")
+
+        print(f"[Presentation +] Rendering PPTX file with {len(content_data.get('slides', []))} slides...")
+        prs = create_dynamic_pptx(content_data, design_data)
+
+        # 4. Save and return
+        if not transaction_uuid:
+            transaction_uuid = str(uuid.uuid4())
+
+        if not output_folder:
+            output_folder = tempfile.gettempdir()
+
+        import re
+        raw_title = content_data.get("presentation_metadata", {}).get("title", "Dynamic_Presentation")
+        clean_title = "".join([c if c.isalnum() else "_" for c in raw_title]).strip("_")
+        clean_title = re.sub(r'_+', '_', clean_title)
+        clean_title = clean_title[:30] if clean_title else "Dynamic_Presentation"
+
+        out_filename = f"{clean_title}_{transaction_uuid[:8]}.pptx"
+        os.makedirs(output_folder, exist_ok=True)
+        out_path = os.path.join(output_folder, out_filename)
+        prs.save(out_path)
+        print(f"[Presentation +] Saved PPTX to: {out_path}")
+
+        safe_design_data = {k: v for k, v in design_data.items() if k != "logo_bytes"}
+        res_data = {
+            "slides": content_data.get("slides", []),
+            "metadata": content_data.get("presentation_metadata", {}),
+            "design_strategy": safe_design_data,
+            "filename": out_filename,
+            "filepath": out_path,
+            "transaction_uuid": transaction_uuid
+        }
+
+        # Track Transaction
+        await upsert_hls_sales_presentation_plus_transaction(
+            db=db,
+            transaction_uuid=transaction_uuid,
+            format_type=format_type,
+            out_path=out_path,
+            out_filename=out_filename,
+            user_id=user_id,
+            user_name=user_name,
+            domain=domain,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_cost=total_cost,
+        )
+
+        # Update user budget metrics
+        await update_user_budget_and_log(
+            db,
+            user_id,
+            total_cost,
+            model_name="gpt-4o-mini",
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens
+        )
+
+        headers = {
+            "X-Transaction-UUID": transaction_uuid,
+            "X-Input-Tokens": str(input_tokens),
+            "X-Output-Tokens": str(output_tokens),
+            "X-Total-Cost": str(total_cost),
+            "Access-Control-Expose-Headers": "X-Transaction-UUID, X-Input-Tokens, X-Output-Tokens, X-Total-Cost",
+        }
+
+        print(f"[Presentation +] 🎉 Successfully completed! Cost: ${total_cost:.4f}, Total Tokens: {input_tokens + output_tokens}\n")
+
+        return JSONResponse(
+            content=res_data,
+            status_code=200,
+            headers=headers
+        )
+
+    except Exception as e:
+        print(f"❌ handle_sales_presentation_plus error: {e}")
+        import traceback
+        traceback.print_exc()
+
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=500
+        )
 
