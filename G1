@@ -1,1264 +1,1590 @@
-import uuid, json, os, traceback
+Traceback (most recent call last):
+  File "C:\Users\ST127673\Ai_engineering_buddy\batch_process\src\hls_platform\banner.py", line 738, in handle_banner_refine
+    image = Image.open(io.BytesIO(image_data))
+                       ~~~~~~~~~~^^^^^^^^^^^^
+TypeError: a bytes-like object is required, not 'coroutine'
+INFO:     127.0.0.1:0 - "POST /batch_process/hls_platform/banner_refine?domain=sales HTTP/1.1" 500 Internal Server Error
 
-from fastapi import APIRouter, Request, Depends, HTTPException, Path, BackgroundTasks
-from fastapi.responses import JSONResponse
-from ..utils.zenseai_content_factory_utils import get_domain_param
+import asyncio
+import os
+import io
+import json
+import logging
+import re
+from ..utils.utils import getOSpecifiers
+from common.llm_utils.litellm_aexecute import image_llm_aexecute
+from src.hls_platform.hls_constants import get_constant
+from PIL import Image
+from common.database.models.content_factory import HLSBrand, HLSTransaction
+from ..hls_platform.connectors.connector_factory import HLSDomainType
+# from google import genai
+# from google.genai import types
+from ..hls_platform.utils import initialize_5o_mini_llm
+from .brands import BRAND_LOGOS_BASE_DIR
+# from .hls_constants import get_constant
+
+
+from fastapi import Request, Depends
+from fastapi.responses import JSONResponse, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from ..configurations.session import get_session
-from ..hls_platform.sales_presentation_plus import handle_sales_presentation_plus
-from ..hls_platform.sales_banner import (
-    sales_banner_generate_handler,
-    sales_banner_list_templates_handler,
-    sales_banner_template_image_handler,
-    sales_banner_upload_template_handler,
-    sales_banner_delete_template_handler,
-)
-from ..hls_platform.main import hls_uploads_path
-from sqlalchemy import text, select
-from ..config import settings
-
-from common.database.models.content_factory import SalesCFeedback
 
 
-from ..hls_platform.sharepoint_workflow import (
-    sync_sharepoint_files_handler,
-    get_sharepoint_microsites_helper,
-    send_sharepoint_microsite_by_id_helper,
-    convert_sharepoint_microsite_by_id_helper
-)
-from ..hls_platform.local_documents import upload_local_document_helper
-from ..hls_platform.brands import get_image_url_helper
-from ..hls_platform.presentation_templates_api import (
-    get_templates_helper,
-    create_template_helper,
-    delete_template_helper
-)
-
-sales_content_factory_router = APIRouter(prefix="/sales_platform", tags=["Sales Platform"])
+logger = logging.getLogger(__name__)
 
 
-# ---------- Sales Banner Generation Routes ----------
-@sales_content_factory_router.post("/banner/generate")
-async def sales_generate_banner(request: Request, db: AsyncSession = Depends(get_session)):
-    """
-    Generate an AI-edited sales banner from one of the approved templates.
+# Gemini-supported aspect ratios with display names
+BANNER_SIZES = {
+    '1:1':  'Square',
+    '3:2':  'Standard Landscape',
+    '2:3':  'Standard Portrait',
+    '3:4':  'Portrait',
+    '4:3':  'Landscape',
+    '4:5':  'Tall Square',
+    '5:4':  'Wide Square',
+    '9:16': 'Story / Skyscraper',
+    '16:9': 'Widescreen',
+    '21:9': 'Ultra Widescreen',
+}
 
-    Request payload:
-    {
-        "template_id": "template-6",
-        "title": "Q3 Sales Champion",
-        "description": "Congratulations on closing the year with record numbers",
-        "prompt": "make the confetti more subtle",
-        "aspect_ratio": "16:9",
-        "photo": "data:image/png;base64,..."   // optional — omit to keep the template's existing photo
-    }
-
-    User identity is resolved the same way sales_generate_presentation_plus
-    resolves it below — body first, JWT + a user_entity lookup as fallback
-    — and passed down as plain parameters rather than re-resolved inside
-    the handler.
-    """
-    data = await request.json()
-
-    user_id = data.get('userId') or data.get('user_id')
-    user_name = data.get('userName') or data.get('user_name', 'Unknown User')
-    print(f"[banner/generate] user_id from request body: {user_id!r}")
-
-    # fallback user_id from token
-    if not user_id or not str(user_id).isdigit() or str(user_id) in ["null", "unknown_user", "None"]:
-        auth_header = request.headers.get('Authorization')
-        print(f"[banner/generate] no usable user_id in body — Authorization header: "
-              f"{'present' if auth_header else 'MISSING'}")
-        if auth_header and auth_header.startswith('Bearer '):
-            token = auth_header.split(' ', 1)[1]
-            import jwt as pyjwt
-            sub = None
-            try:
-                jwt_secret_key = settings.jwt.secret_key
-                decoded = pyjwt.decode(token, jwt_secret_key, algorithms=["HS256"])
-                sub = decoded.get('sub')
-                print(f"[banner/generate] token decoded OK — sub={sub!r}")
-            except pyjwt.exceptions.InvalidSignatureError as e:
-                # Confirmed via direct testing: this token is well-formed,
-                # fresh, and not expired — the signing key just doesn't
-                # match settings.jwt.secret_key. That's worth fixing at
-                # the source. In the meantime: this decode is only ever
-                # used to attribute a Content History row to a user, never
-                # to gate access to anything in this handler, so reading
-                # sub without verifying the signature is safe here
-                # specifically — it is NOT a general "skip auth" pattern.
-                print(f"[banner/generate] signature check failed ({e}) — "
-                      f"falling back to unverified decode for attribution only")
-                try:
-                    unverified = pyjwt.decode(token, options={"verify_signature": False})
-                    sub = unverified.get('sub')
-                    print(f"[banner/generate] unverified decode — sub={sub!r}")
-                except Exception as e2:
-                    print("[banner/generate] Unverified decode also failed:", e2)
-            except Exception as e:
-                print("[banner/generate] Token decode failed:", e)
-
-            try:
-                if sub:
-                    q = text("SELECT id, name FROM user_entity WHERE email = :email")
-                    result = await db.execute(q, {"email": sub})
-                    r = result.mappings().first()
-                    print(f"[banner/generate] user_entity lookup for {sub!r}: "
-                          f"{'found id=' + str(r['id']) if r else 'NO MATCH'}")
-
-                    if r:
-                        user_id = str(r["id"])
-                        if user_name == "Unknown User":
-                            user_name = r["name"]
-
-            except Exception as e:
-                print("[banner/generate] user_entity lookup failed:", e)
-        else:
-            print("[banner/generate] no Bearer token present — user_id stays unresolved")
-
-    print(f"[banner/generate] final: user_id={user_id!r} user_name={user_name!r}")
-    return await sales_banner_generate_handler(request, db, user_id=user_id, user_name=user_name)
+# Layout hints per ratio for the image generation prompt
+LAYOUT_HINTS = {
+    '21:9': "ultra-wide horizontal strip — bold headline far left, dominant visual centre-right",
+    '16:9': "wide horizontal strip — bold headline on the left, dominant visual on the right",
+    '3:2':  "landscape rectangle — visual dominant left two-thirds, text right third",
+    '4:3':  "landscape rectangle — two-zone split: visual left half, headline + supporting line right half",
+    '5:4':  "slightly landscape rectangle — headline top, visual centre",
+    '1:1':  "square — centred composition: headline top, dominant visual middle",
+    '4:5':  "slightly portrait rectangle — headline top, visual large centre",
+    '3:4':  "portrait rectangle — stacked top-to-bottom: headline, visual, supporting line",
+    '2:3':  "portrait rectangle — stacked: headline, visual",
+    '9:16': "tall vertical strip — stacked: small icon top, large bold headline upper-middle, supporting line below",
+}
 
 
-@sales_content_factory_router.get("/banner/templates")
-async def sales_list_banner_templates():
-    """The single source of truth the picker fetches from — no more
-    frontend-bundled copy that can drift out of sync with this folder."""
-    return await sales_banner_list_templates_handler()
+def get_aspect_ratio(size_str: str) -> tuple[str, str]:
+    """Return (ratio, label) for a supported Gemini aspect ratio string. Raises ValueError if unsupported."""
+    s = size_str.strip()
+    if s in BANNER_SIZES:
+        return s, BANNER_SIZES[s]
+    supported = ', '.join(BANNER_SIZES.keys())
+    raise ValueError(f"Unsupported aspect ratio '{size_str}'. Gemini supports: {supported}")
 
 
-@sales_content_factory_router.get("/banner/templates/{template_id}/image")
-async def sales_get_banner_template_image(template_id: str, w: int | None = None):
-    return await sales_banner_template_image_handler(template_id, width=w)
-
-
-@sales_content_factory_router.post("/banner/templates")
-async def sales_upload_banner_template(request: Request):
-    """Body: {"name": "Sales Champion", "image": "data:image/png;base64,..."}"""
-    return await sales_banner_upload_template_handler(request)
-
-
-@sales_content_factory_router.delete("/banner/templates/{template_id}")
-async def sales_delete_banner_template(template_id: str):
-    return await sales_banner_delete_template_handler(template_id)
-
-
-# ---------- Routes ----------
-@sales_content_factory_router.get("/get_all_microsites")
-async def sales_get_all_microsites(db: AsyncSession = Depends(get_session)):
-    return await get_sharepoint_microsites_helper(db)
-
-
-@sales_content_factory_router.post("/sharepoint/sync")
-async def sales_sharepoint_sync(db: AsyncSession = Depends(get_session)):
-    return await sync_sharepoint_files_handler(db)
-
-
-@sales_content_factory_router.post("/send_microsite_by_id")
-async def sales_send_microsite_by_id(request: Request,
-    db: AsyncSession = Depends(get_session)):
-    return await send_sharepoint_microsite_by_id_helper(request, db)
-
-
-@sales_content_factory_router.post("/sharepoint/convert")
-async def sales_convert_sharepoint_microsite(request: Request,
-    db: AsyncSession = Depends(get_session)):
-    return await convert_sharepoint_microsite_by_id_helper(request, db)
-
-
-@sales_content_factory_router.get("/image_url/{document_path:path}")
-async def sales_get_image_url(document_path: str = Path(...)):
-    return await get_image_url_helper(document_path)
-
-
-@sales_content_factory_router.post("/local_documents")
-async def sales_upload_local_document(request: Request, db: AsyncSession = Depends(get_session)):
-    domain = await get_domain_param(request)
-    return await upload_local_document_helper(domain, request, db)
-
-
-@sales_content_factory_router.get("/templates")
-async def sales_get_templates(request: Request, db: AsyncSession = Depends(get_session)):
-    domain = await get_domain_param(request)
-    return await get_templates_helper(domain, db, request)
-
-
-@sales_content_factory_router.post("/templates")
-async def sales_create_template(request: Request, db: AsyncSession = Depends(get_session)):
-    domain = await get_domain_param(request)
-    return await create_template_helper(domain, request, db)
-
-
-@sales_content_factory_router.delete("/templates/{template_id}")
-async def sales_delete_template(template_id: int, db: AsyncSession = Depends(get_session)):
-    return await delete_template_helper(template_id, db)
-
-
-@sales_content_factory_router.post("/sales/presentation/render_pptx")
-async def sales_render_sales_presentation(request: Request):
+async def get_brand_logo_bytes(
+    brand_name: str,
+    db: AsyncSession
+) -> tuple[bytes | None, str]:
+    """Look up brand logo from DB by brand name and return (bytes, mime_type)."""
     try:
-        from ..hls_platform.sales_presentation import render_edited_sales_presentation
+        result = await db.execute(
+            select(HLSBrand).where(
+                HLSBrand.fieldname == 'brand_name',
+                HLSBrand.fieldvalue == brand_name
+            )
+        )
+        name_row = result.scalars().first()
 
-        data = await request.json()
-        domain = await get_domain_param(request)
+        if not name_row:
+            logger.info(f"Brand '{brand_name}' not found in DB")
+            return None, ''
 
-        return render_edited_sales_presentation(
-            data=data,
-            user_id=data.get('userId') or data.get('user_id'),
-            user_name=data.get('userName') or data.get('user_name', 'Unknown User'),
-            transaction_uuid=data.get('transaction_uuid'),
-            output_folder=data.get('output_folder'),
-            format_type=data.get('format_type'),
-            domain=domain,
-            downloaded_files=data.get('downloaded_files'),
-            input_folder=data.get('input_folder'),
-            usage_stats={
-                'prompt_tokens': data.get('input_tokens', 0),
-                'completion_tokens': data.get('output_tokens', 0),
-                'cost': data.get('total_cost', 0.0)
-            }
+        result = await db.execute(
+            select(HLSBrand).where(
+                HLSBrand.brand_id == name_row.brand_id,
+                HLSBrand.fieldname == 'brand_logo'
+            )
+        )
+        logo_row = result.scalars().first()
+
+        if not logo_row or not logo_row.fieldvalue:
+            logger.info(f"No logo found for brand '{brand_name}'")
+            return None, ''
+
+        # Stored as "hls_brand_logos/<brand_id>/<filename>"
+        rel = logo_row.fieldvalue
+
+        if rel.startswith('hls_brand_logos/') or rel.startswith('hls_brand_logos\\'):
+            rel = rel[len('hls_brand_logos/'):]
+
+        logo_path = os.path.join(BRAND_LOGOS_BASE_DIR, rel)
+
+        if not os.path.exists(logo_path):
+            logger.warning(f"Logo file not found on disk: {logo_path}")
+            return None, ''
+
+        ext = os.path.splitext(logo_path)[1].lower()
+        mime_map = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp'
+        }
+        mime_type = mime_map.get(ext, 'image/png')
+
+        with open(logo_path, 'rb') as f:
+            return f.read(), mime_type
+
+    except Exception as e:
+        logger.warning(f"Could not load brand logo for '{brand_name}': {e}")
+        return None, ''
+
+
+def generate_hero_banner_prompt(llm, content: str, aspect_ratio: str,
+                                 size_label: str, intent: str,
+                                 brand_name: str, has_logo: bool,
+                                 feedback: str = '') -> str:
+    """Use LLM to craft a Gemini image-generation prompt for a hero banner.
+    Pass feedback to refine an existing version.
+    """
+
+    layout_hint = LAYOUT_HINTS.get(aspect_ratio, LAYOUT_HINTS["16:9"])
+
+    logo_instruction = (
+        "MANDATORY — A brand logo image IS PROVIDED as an input image. "
+        "You MUST embed it visibly in the final banner: place it in the top-left or bottom-right corner, "
+        "scaled proportionally, never distorted, never cropped, never faded. "
+        "The logo must be clearly legible at all times. Omitting the logo is NOT acceptable."
+        if has_logo else
+        "No logo provided — do not fabricate one."
+    )
+
+    # Split "Brand Name - color palette info" if present
+    brand_parts = brand_name.split(' - ', 1) if brand_name else []
+    brand_display = brand_parts[0].strip() if brand_parts else ''
+    color_palette_info = brand_parts[1].strip() if len(brand_parts) > 1 else ''
+
+    brand_instruction = ''
+    if brand_display:
+        brand_instruction = f"• Brand name   : {brand_display}"
+    if color_palette_info:
+        brand_instruction += f"\n• Color palette: {color_palette_info} — use these exact brand colors throughout"
+
+    intent_line = f"• Campaign intent: {intent}" if intent else ''
+
+    feedback_section = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REFINEMENT FEEDBACK — apply all of the following changes to the new prompt:
+{feedback}
+""" if feedback else ''
+
+    prompt = f"""
+You are an award-winning digital advertising creative director specialising in pharma and healthcare hero banners.
+
+Your task: produce ONE highly detailed image-generation prompt to create a professional hero banner.
+{feedback_section}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SOURCE CONTENT (use in full):
+{content}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BANNER SPECS:
+• Aspect ratio : {aspect_ratio}  ({size_label})
+• Layout       : {layout_hint}
+{intent_line}
+{brand_instruction}
+• Logo         : {logo_instruction}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HERO BANNER PRINCIPLES — follow ALL strictly:
+
+1. HEADLINE (MANDATORY) — one bold headline directly derived from the source content AND campaign intent; max 10 words; placed prominently over the background
+2. CAPTION (MANDATORY) — one concise caption line placed directly below the headline; must reinforce the content and intent as a benefit statement or proof point; never skip this
+3. BACKGROUND IMAGE (MANDATORY) — a full-bleed, contextually relevant photographic or illustrated scene derived from the document content; it fills the entire canvas as a background layer; text is overlaid on top with sufficient contrast (use a semi-transparent dark/light overlay or frosted panel behind text if needed for legibility)
+4. Brand logo — placed exactly as instructed above; MANDATORY if provided — treat as a hard requirement, never omit
+5. CLEAN text overlay — headline and caption centered or left-aligned over background; generous spacing; strong typographic hierarchy; nothing crowded
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUALITY STANDARDS:
+• Ultra-sharp, premium resolution at {aspect_ratio} aspect ratio
+• Modern pharma/healthcare aesthetic — think leading campaign quality
+• Background image must be a rich, realistic, full-bleed scene directly relevant to the document subject — not a pattern, not flat white, not abstract shapes
+• If background contains any human figures or faces: ZERO distortions — anatomically correct, natural proportions, lifelike skin, no merged limbs, no extra fingers, no blurred faces; photorealistic quality mandatory
+• Colors MUST follow brand palette if provided; otherwise max 3 harmonious colors
+• Clean sans-serif typography; bold headline, lighter caption below
+• No logos of real companies, no regulatory text, no fine print
+• Depth through soft shadows, a subtle dark/light gradient overlay on background for text contrast
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT RULES:
+• Return ONLY the final image-generation prompt — no explanation, no markdown
+• Must include: aspect ratio {aspect_ratio}, exact headline text from content, exact caption text from content, full-bleed background scene description, human figure quality instructions (if humans present), color palette, logo placement
+• All content derived from source — no hallucinated facts
+
+Generate the hero banner prompt now.
+"""
+    response = llm.invoke(prompt)
+    image_prompt = response.content.strip()
+    print(f"🎨 Hero banner prompt ({aspect_ratio} — {size_label}):\n{image_prompt[:300]}...")
+    return image_prompt
+
+
+async def generate_banner_image(
+    image_prompt: str,
+    db: AsyncSession,
+    logo_bytes: bytes | None = None,
+    logo_mime: str = "image/png"
+) -> bytes:
+    """Call LiteLLM Gemini to generate the banner. Passes logo as image input if provided."""
+    print("🖼️  Calling LiteLLM Gemini for hero banner generation...")
+
+    if logo_bytes:
+        print(f"🏷️  Brand logo included ({len(logo_bytes)} bytes, {logo_mime})")
+
+    result = await image_llm_aexecute(
+        prompt=image_prompt,
+        db=db,
+        image_bytes=logo_bytes,
+        image_mime=logo_mime
+    )
+
+    if result.get("status_code") != 200:
+        raise ValueError(
+            result.get("message")
+            or result.get("error")
+            or "LiteLLM Gemini image generation failed"
         )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    image_data = result.get("image_bytes")
+
+    if not image_data:
+        raise ValueError("No image bytes returned from LiteLLM Gemini")
+
+    return image_data
 
 
-@sales_content_factory_router.post("/sales/presentation/regenerate_slide")
-async def sales_regenerate_sales_slide(request: Request):
+async def handle_banner(
+    document_content,
+    format_type,
+    output_folder,
+    downloaded_files,
+    domain: HLSDomainType,
+    db: AsyncSession,
+    user_id=None,
+    user_name=None,
+    transaction_uuid=None,
+    input_folder=None,
+    banner_options=None
+):
+    print("\n🎨 Generating Hero Banner...\n")
+
     try:
-        from ..hls_platform.sales_presentation import regenerate_sales_slide
+        banner_options = banner_options or {}
 
-        data = await request.json()
-        domain = await get_domain_param(request)
+        size_str = banner_options.get("size", "16:9")
+        intent = banner_options.get("intent", "")
+        brand_name = banner_options.get("brand_guidelines", "")
 
-        slide_data = data.get('slide_data')
-        custom_prompt = data.get('custom_prompt')
-        user_id = data.get('userId') or data.get('user_id')        
-        if not slide_data:
-            raise HTTPException(status_code=400, detail="Missing slide_data")
+        aspect_ratio, size_label = get_aspect_ratio(size_str)
+        print(f"📐 Aspect ratio: {aspect_ratio} ({size_label})")
 
-        updated_slide = regenerate_sales_slide(slide_data, custom_prompt, user_id=user_id, domain=domain)
+        # brand_name may be "Brand Name - color palette info"; extract just the name for logo lookup
+        brand_name_only = brand_name.split(' - ', 1)[0].strip() if brand_name else ''
 
-        if "error" in updated_slide:
-            raise HTTPException(status_code=500, detail=updated_slide)
+        if brand_name_only:
+            logo_bytes, logo_mime = await get_brand_logo_bytes(brand_name_only, db)
+        else:
+            logo_bytes, logo_mime = None, ''
 
-        return JSONResponse(content=updated_slide)
+        if logo_bytes:
+            print(f"🏷️  Brand logo loaded for '{brand_name_only}'")
+        else:
+            print("ℹ️  No brand logo — generating without logo")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-@sales_content_factory_router.post('/sales/presentation_plus/generate')
-async def sales_generate_presentation_plus(request: Request, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_session)):
-    try:
-        data = await request.json()
-        domain = request.query_params.get("domain")
+        # Step 1: LLM generates image prompt
+        llm = await initialize_5o_mini_llm(db, domain)
 
-        user_id = data.get('userId') or data.get('user_id')
-        user_name = data.get('userName') or data.get('user_name', 'Unknown User')
+        image_prompt = await asyncio.to_thread(
+            generate_hero_banner_prompt,
+            llm,
+            document_content,
+            aspect_ratio,
+            size_label,
+            intent,
+            brand_name,
+            bool(logo_bytes)
+        )
 
-        # fallback user_id from token
-        if not user_id or not str(user_id).isdigit() or str(user_id) in ["null", "unknown_user", "None"]:
-            auth_header = request.headers.get('Authorization')
-            if auth_header and auth_header.startswith('Bearer '):
-                token = auth_header.split(' ', 1)[1]
-                import jwt as pyjwt
-                try:
-                    jwt_secret_key = settings.jwt.secret_key
-                    decoded = pyjwt.decode(token, jwt_secret_key, algorithms=["HS256"])
-                    sub = decoded.get('sub')
+        # Step 2: Gemini generates image
+        
+        # Step 2: LiteLLM Gemini generates image
 
-                    if sub:
-                        q = text("SELECT id, name FROM user_entity WHERE email = :email")
-                        result = await db.execute(q, {"email": sub})
-                        r = result.mappings().first()
+        image_data = await generate_banner_image(
+            image_prompt,
+            db,
+            logo_bytes,
+            logo_mime,
+        )
 
-                        if r:
-                            user_id = str(r["id"])
-                            if user_name == "Unknown User":
-                                user_name = r["name"]
 
-                except Exception as e:
-                    print("Token decode failed:", e)
+        if not image_data:
+            raise ValueError("No image data returned from Gemini")
 
-        transaction_uuid = data.get('transaction_uuid')
-        output_folder = data.get('output_folder')
-        format_type = data.get('format_type', 'presentation +')
-        downloaded_files = data.get('downloaded_files')
-        input_folder = data.get('input_folder')
-        presentation_options = data.get('presentation_options', {})
+        # Save file
+        os.makedirs(output_folder, exist_ok=True)
 
-        # Always create a new UUID for Presentation + to avoid clashing with normal presentation
-        transaction_uuid = str(uuid.uuid4())
+        base_names = []
 
-        uuid_path = os.path.join(hls_uploads_path, transaction_uuid)
+        for filename in downloaded_files:
+            base = os.path.splitext(filename)[0]
+            base = re.sub(r'[^\w\s-]', '', base)
+            base = re.sub(r'[-\s]+', '_', base)
+            base_names.append(base)
 
-        if not input_folder:
-            input_folder = os.path.join(uuid_path, "input_folder")
-            os.makedirs(input_folder, exist_ok=True)
+        ratio_tag = aspect_ratio.replace(':', 'x')
+        format_part = format_type.replace(' ', '_')
+        source_part = '_'.join(base_names)
 
-        if not output_folder:
-            output_folder = os.path.join(uuid_path, "output_folder")
-            os.makedirs(output_folder, exist_ok=True)
+        if not source_part:
+            source_part = "banner"
 
-        veeva_file_ids = data.get('veeva_file_ids', [])
-        combined_content = data.get('combined_content', '')
+        base_filename = f"{format_part}_{source_part}_{ratio_tag}"
 
-        if not combined_content and veeva_file_ids:
-            from ..hls_platform.connectors import connector_factory
-            from ..hls_platform.connectors.connector_factory import get_connector
+        counter = 1
+        file_name = f"{base_filename}.png"
+        file_path = os.path.join(output_folder, file_name)
 
-            connector = get_connector(connector_factory.get_connector_name_by_domain(domain))
-            downloaded_files, combined_content = await connector.download_all_files(db, veeva_file_ids, input_folder)
+        while os.path.exists(file_path):
+            counter += 1
+            file_name = f"{base_filename}_{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
 
-        status_file = os.path.join(uuid_path, "status.json")
+        image = Image.open(io.BytesIO(image_data))
+        image.save(file_path, 'PNG')
 
-        async def update_step(msg):
+        print(f"✅ Banner saved: {file_path}")
+
+        # Save DB transaction
+        if user_id and transaction_uuid and input_folder:
             try:
-                if os.path.exists(status_file):
-                    with open(status_file, "r") as f:
-                        data = json.load(f)
-                    data["step"] = msg
-                    with open(status_file, "w") as f:
-                        json.dump(data, f)
-            except:
-                pass
+                input_file_paths_json = json.dumps([
+                    os.path.abspath(os.path.join(input_folder, f))
+                    for f in downloaded_files
+                ])
 
-        async def background_task():
-            try:
-                with open(status_file, "w") as f:
-                    json.dump({
-                        "status": "processing",
-                        "transaction_uuid": transaction_uuid,
-                        "step": "Initializing... (Please wait)"
-                    }, f)
-
-                resp = await handle_sales_presentation_plus(
-                    db=db,
-                    combined_content=combined_content,
-                    format_type=format_type,
-                    output_folder=output_folder,
-                    downloaded_files=downloaded_files,
-                    domain=domain,
-                    user_id=user_id,
-                    user_name=user_name,
-                    transaction_uuid=transaction_uuid,
-                    input_folder=input_folder,
-                    presentation_options=presentation_options,
-                    status_callback=update_step
+                db.add(
+                    HLSTransaction(
+                        uuid=transaction_uuid,
+                        format_type=format_type,
+                        input_file_paths=input_file_paths_json,
+                        output_file_path=os.path.abspath(file_path),
+                        created_by=str(user_id),
+                        created_person=str(user_name),
+                        domain=domain
+                    )
                 )
 
-                if resp.status_code == 200:
-                    res_data = json.loads(resp.body.decode("utf-8"))
-                    with open(status_file, "w") as f:
-                        json.dump({
-                            "status": "completed",
-                            "response_json": res_data,
-                            "filepath": res_data.get("filepath"),
-                            "filename": res_data.get("filename"),
-                            "inputTokens": resp.headers.get('X-Input-Tokens', 0),
-                            "outputTokens": resp.headers.get('X-Output-Tokens', 0),
-                            "totalCost": resp.headers.get('X-Total-Cost', 0)
-                        }, f)
-                else:
-                    with open(status_file, "w") as f:
-                        json.dump({
-                            "status": "error",
-                            "message": "Failed to generate Presentation+"
-                        }, f)
+                await db.commit()
+                print(f"✅ Transaction saved: {transaction_uuid}")
 
-            except Exception as e:
-                traceback.print_exc()
-                with open(status_file, "w") as f:
-                    json.dump({
-                        "status": "error",
-                        "message": str(e)
-                    }, f)
+            except Exception as db_error:
+                print(f"⚠️  DB save failed: {db_error}")
+                await db.rollback()
 
-        # run background
-        background_tasks.add_task(background_task)
+        with open(file_path, 'rb') as f:
+            final_image_data = f.read()
 
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "processing",
-                "transaction_uuid": transaction_uuid
+        return Response(
+            content=final_image_data,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "X-Transaction-UUID": str(transaction_uuid),
+                "Access-Control-Expose-Headers": "X-Transaction-UUID"
             }
         )
 
     except Exception as e:
+        logger.error(f"Error in handle_banner: {e}")
+        print(f"❌ Hero banner generation failed: {e}")
+
+        import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))    
 
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500
+        )
 
-@sales_content_factory_router.post('/content_feedback')
-async def sales_submit_content_feedback(request: Request, db: AsyncSession = Depends(get_session)):
-    """Store user star-rating and/or text feedback for a Sales CF generated content item.
-    Both fields are optional; if the user skips, both will be stored as NULL.
-    """
+async def handle_workflow_banner(
+    document_content,
+    format_type,
+    output_folder,
+    domain: HLSDomainType,
+    db: AsyncSession,
+    user_id=None,
+    user_name=None,
+    transaction_uuid=None,
+    input_folder=None,
+    banner_options=None,
+    workflow_meta=None
+):
+    print("\n🎨 Generating Hero Banner...\n")
+
     try:
-        data = await request.json() or {}
-        domain = request.query_params.get("domain")
-        
-        transaction_uuid = data.get("transaction_uuid")
+        banner_options = banner_options or {}
+
+        size_str = banner_options.get("size", "16:9")
+        intent = banner_options.get("intent", "")
+        brand_name = banner_options.get("brand_guidelines", "")
+
+        aspect_ratio, size_label = get_aspect_ratio(size_str)
+
+        print(f"📐 Aspect ratio: {aspect_ratio} ({size_label})")
+
+        # brand_name may be "Brand Name - color palette info"; extract just the name for logo lookup
+        brand_name_only = brand_name.split(' - ', 1)[0].strip() if brand_name else ''
+
+        if brand_name_only:
+            logo_bytes, logo_mime = await get_brand_logo_bytes(brand_name_only, db)
+        else:
+            logo_bytes, logo_mime = None, ''
+
+        if logo_bytes:
+            print(f"🏷️  Brand logo loaded for '{brand_name_only}'")
+        else:
+            print("ℹ️  No brand logo — generating without logo")
+
+        # Step 1: LLM generates image prompt
+        llm = await initialize_5o_mini_llm(db=db, domain=domain)
+
+        image_prompt = await asyncio.to_thread(
+            generate_hero_banner_prompt,
+            llm,
+            document_content,
+            aspect_ratio,
+            size_label,
+            intent,
+            brand_name,
+            bool(logo_bytes)
+        )
+
+        # Step 2: Gemini generates image
+        image_data = await generate_banner_image(
+            image_prompt,
+            db,
+            logo_bytes,
+            logo_mime
+        )
+
+        if not image_data:
+            raise ValueError("No image data returned from Gemini")
+
+        # Save file
+        os.makedirs(output_folder, exist_ok=True)
+
+        ratio_tag = aspect_ratio.replace(':', 'x')
+        format_part = format_type.replace(' ', '_')
+        source_part = re.sub(r'[^\w\s-]', '', brand_name)
+        source_part = re.sub(r'[-\s]+', '_', source_part)
+
+        base_filename = f"{format_part}_{source_part}_{ratio_tag}"
+
+        counter = 1
+        file_name = f"{base_filename}.png"
+        file_path = os.path.join(output_folder, file_name)
+
+        while os.path.exists(file_path):
+            counter += 1
+            file_name = f"{base_filename}_{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
+
+        image = Image.open(io.BytesIO(image_data))
+        image.save(file_path, 'PNG')
+
+        print(f"✅ Banner saved: {file_path}")
+
+        # Save DB transaction
+        if user_id and transaction_uuid and input_folder:
+            try:
+                input_file_paths_json = json.dumps([os.path.abspath(input_folder)])
+                wf = workflow_meta or {}
+
+                db.add(HLSTransaction(
+                    uuid=transaction_uuid,
+                    format_type=format_type,
+                    input_file_paths=input_file_paths_json,
+                    output_file_path=os.path.abspath(file_path),
+                    created_by=str(user_id),
+                    created_person=str(user_name),
+                    domain=domain,
+                    is_workflow=bool(wf.get('is_workflow', False)),
+                    workflow_type=wf.get('workflow_type'),
+                    workflow_run_id=wf.get('workflow_run_id'),
+                    workflow_step_name=wf.get('workflow_step_name'),
+                ))
+
+                await db.commit()
+                print(f"✅ Transaction saved: {transaction_uuid}")
+
+            except Exception as db_error:
+                print(f"⚠️  DB save failed: {db_error}")
+                await db.rollback()
+
+        with open(file_path, 'rb') as f:
+            final_image_data = f.read()
+
+        return Response(
+            content=final_image_data,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "X-Transaction-UUID": str(transaction_uuid),
+                "Access-Control-Expose-Headers": "X-Transaction-UUID"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error in handle_workflow_banner: {e}")
+        print(f"❌ Hero banner generation failed: {e}")
+
+        import traceback
+        traceback.print_exc()
+
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500
+        )
+
+async def refine_banner_image(
+    image_bytes: bytes,
+    image_mime: str,
+    feedback: str,
+    db: AsyncSession
+) -> bytes:
+    """Send the existing banner image + user feedback to LiteLLM Gemini for refinement."""
+    print(f"✏️  Refining banner image with feedback: {feedback[:120]}...")
+
+    refinement_prompt = f"""You are a professional banner image editor. You have been given an existing hero banner image.
+
+YOUR ONLY JOB: Apply EXACTLY the changes described in the USER REQUEST below — nothing else.
+
+USER REQUEST:
+{feedback}
+
+STRICT RULES — you MUST follow all of these without exception:
+1. ONLY change what the user explicitly asked for. Every other element must remain pixel-perfect identical.
+2. PRESERVE the exact aspect ratio and canvas dimensions of the original image — do NOT crop, letterbox, or resize.
+3. PRESERVE all text — headlines, captions, body copy — exactly as they appear: same wording, same font style, same size, same position, same color, unless the user explicitly asked to change text.
+4. PRESERVE the brand logo — same position, same size, same appearance. Never move, resize, recolor, or remove it.
+5. PRESERVE the overall layout and composition — element positions, alignment zones, and spacing must stay the same.
+6. PRESERVE image resolution and output quality — match the original sharpness, detail level, and file quality.
+7. PRESERVE the color palette for all unchanged elements — do not drift or reinterpret colors elsewhere in the image.
+8. PRESERVE typography hierarchy — font weights, sizes, and styles must not change unless explicitly requested.
+9. Do NOT add new elements, decorations, watermarks, or design features that were not in the original.
+10. Do NOT reinterpret the overall design — this is a surgical edit, not a redesign.
+
+Apply only the requested change now and return the edited image."""
+
+    result = await image_llm_aexecute(
+        prompt=refinement_prompt,
+        db=db,
+        image_bytes=image_bytes,
+        image_mime=image_mime
+    )
+
+    if result.get("status_code") != 200:
+        raise ValueError(
+            result.get("message")
+            or result.get("error")
+            or "LiteLLM Gemini image refinement failed"
+        )
+
+    image_data = result.get("image_bytes")
+
+    if not image_data:
+        raise ValueError("No image bytes returned from LiteLLM Gemini during refinement")
+
+    return image_data
+
+
+async def handle_banner_refine(
+    request: Request,
+    domain: HLSDomainType,
+    db: AsyncSession
+):
+    """Refine an existing banner under the same transaction UUID."""
+
+    try:
+        data = await request.json()
+
+        transaction_uuid = data.get('transaction_uuid', '').strip()
+        feedback = data.get('feedback', '').strip()
+        user_id = data.get('user_id', '')
+        user_name = data.get('user_name', '')
+
+        if not transaction_uuid:
+            return JSONResponse(
+                content={"success": False, "error": "Missing transaction_uuid"},
+                status_code=400
+            )
+
+        if not feedback:
+            return JSONResponse(
+                content={"success": False, "error": "Missing feedback"},
+                status_code=400
+            )
+
+        # Look up the transaction to find the current image path
         result = await db.execute(
-            select(SalesCFeedback).where(
-                SalesCFeedback.transaction_uuid == transaction_uuid
+            select(HLSTransaction).where(
+                HLSTransaction.uuid == transaction_uuid
             )
         )
-        existing = result.scalars().first()
+        transaction = result.scalars().first()
 
-
-        if existing:
-            if data.get('star_rating') is not None:
-                existing.star_rating = data.get('star_rating')
-            if data.get('feedback_text') is not None:
-                existing.feedback_text = data.get('feedback_text')
-            feedback_id = existing.id
-        else:
-            feedback = SalesCFeedback(
-                transaction_uuid=transaction_uuid,
-                format_type=data.get('format_type'),
-                domain=data.get('domain', 'sales'),
-                star_rating=data.get('star_rating'),
-                feedback_text=data.get('feedback_text'),
-                user_id=str(data.get('user_id')) if data.get('user_id') else None,
-                user_name=data.get('user_name'),
+        if not transaction:
+            return JSONResponse(
+                content={"success": False, "error": "Transaction not found"},
+                status_code=404
             )
 
-            db.add(feedback)
-            await db.flush()  # To get auto-generated id
+        existing_edits = (
+            json.loads(transaction.edited_file_paths)
+            if transaction.edited_file_paths
+            else []
+        )
 
-            feedback_id = feedback.id
+        # Resolve which version to refine from.
+        # source_version_idx: 0 = original, 1 = first edit, 2 = second edit, ...
+        source_version_idx = data.get('source_version_idx')
+
+        if source_version_idx is None:
+            current_image_path = (
+                existing_edits[-1]
+                if existing_edits
+                else transaction.output_file_path
+            )
+        else:
             
+            try:
+                source_version_idx = int(source_version_idx)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    content={"success": False, "error": "Invalid source_version_idx"},
+                    status_code=400
+                )
+
+
+            if source_version_idx == 0:
+                current_image_path = transaction.output_file_path
+            else:
+                edit_idx = source_version_idx - 1
+
+                if edit_idx >= len(existing_edits):
+                    return JSONResponse(
+                        content={
+                            "success": False,
+                            "error": f"Version {source_version_idx} not found "
+                                     f"(only {len(existing_edits)} edits exist)"
+                        },
+                        status_code=404
+                    )
+
+                current_image_path = existing_edits[edit_idx]
+
+        if not current_image_path or not os.path.exists(current_image_path):
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "error": "Current banner image not found on disk"
+                },
+                status_code=404
+            )
+
+        with open(current_image_path, 'rb') as f:
+            current_image_bytes = f.read()
+
+        ext = os.path.splitext(current_image_path)[1].lower()
+        image_mime = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg'
+        }.get(ext, 'image/png')
+
+        print(
+            f"🖼️  Refining banner from disk: "
+            f"{current_image_path} ({len(current_image_bytes)} bytes)"
+        )
+
+        # Send image + feedback directly to Gemini
+        api_key = await get_constant("gemini_api_key", db)
+
+        image_data = await asyncio.to_thread(
+            refine_banner_image,
+            current_image_bytes,
+            image_mime,
+            feedback,
+            api_key
+        )
+
+
+        if not image_data:
+            raise ValueError("No image data returned from Gemini")
+
+        # Save into the same transaction output folder
+        output_folder = os.path.dirname(transaction.output_file_path)
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Version number = how many edited files already exist + 2
+        version_num = len(existing_edits) + 2
+
+        base = os.path.splitext(os.path.basename(transaction.output_file_path))[0]
+        file_name = f"{base}_v{version_num}.png"
+        file_path = os.path.join(output_folder, file_name)
+
+        # Ensure unique filename
+        counter = version_num
+
+        while os.path.exists(file_path):
+            counter += 1
+            file_name = f"{base}_v{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
+
+        image = Image.open(io.BytesIO(image_data))
+        image.save(file_path, 'PNG')
+
+        print(f"✅ Refined banner saved: {file_path}")
+
+        # Append to edited_file_paths in DB
+        existing_edits.append(os.path.abspath(file_path))
+        transaction.edited_file_paths = json.dumps(existing_edits)
+
         await db.commit()
 
-        return JSONResponse(content={"status": "success", "id": feedback_id}, status_code=200)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        print(f"✅ edited_file_paths updated ({len(existing_edits)} edits)")
 
+        with open(file_path, 'rb') as rf:
+            final_refined_data = rf.read()
 
-@sales_content_factory_router.get('/sales-feedback/{transaction_uuid}')
-async def sales_get_content_feedback(
-    transaction_uuid: str,
-    db: AsyncSession = Depends(get_session)
-):
-
-    try:
-        result = await db.execute(
-            select(SalesCFeedback)
-            .where(SalesCFeedback.transaction_uuid == transaction_uuid)
-            .order_by(SalesCFeedback.created_at.asc())
+        return Response(
+            content=final_refined_data,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "X-Transaction-UUID": str(transaction_uuid),
+                "X-Version-Number": str(version_num),
+                "Access-Control-Expose-Headers": "X-Transaction-UUID, X-Version-Number"
+            }
         )
 
-        records = result.scalars().all()
-
-
-        if not records:
-            raise HTTPException(status_code=404, detail="No feedback found")
-
-        merged_star = None
-        merged_text = None
-        latest_id = None
-        latest_format = None
-        latest_created_at = None
-
-        for record in records:
-            if record.star_rating is not None:
-                merged_star = record.star_rating
-            if record.feedback_text is not None:
-                merged_text = record.feedback_text
-            latest_id = record.id
-            latest_format = record.format_type
-            latest_created_at = record.created_at
-
-        return {
-            "id": latest_id,
-            "transaction_uuid": transaction_uuid,
-            "format_type": latest_format,
-            "star_rating": merged_star,
-            "feedback_text": merged_text,
-            "created_at": latest_created_at.isoformat() if latest_created_at else None,
-        }
-
     except Exception as e:
+        await db.rollback()
+
+        logger.error(f"Error in handle_banner_refine: {e}")
+
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))        
 
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500
+        )
 
+#Code for retail banner generation for different brand
+def generate_hero_banner_prompt_for_retail(
+    llm,
+    content: str,
+    aspect_ratio: str,
+    size_label: str,
+    intent: str,
+    brand_name: str = None,
+    has_logo: bool = False
+) -> str:
+    """
+    Generate a high-quality retail hero banner image prompt using LLM.
+    Designed for ecommerce campaigns (e.g., Christmas, Back to School, Sales).
+    """
 
+    layout_hint = LAYOUT_HINTS.get(aspect_ratio, LAYOUT_HINTS["16:9"])
+    intent_line = f"• Campaign intent: {intent}" if intent else ""
 
+    brand_line = f"• Brand: {brand_name}" if brand_name else ""
 
+    logo_line = "• Include a placeholder area for brand logo (top corner or subtle overlay)" if has_logo else ""
 
+    prompt = f"""
+You are an award-winning ecommerce creative director specialising in high-conversion retail hero banners for online platforms (Amazon, Flipkart, Shopify, brand websites).
 
+Your task: produce ONE highly detailed image-generation prompt for a premium retail hero banner.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CAMPAIGN CONTEXT (use fully):
+{content}
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BANNER SPECS:
+• Aspect ratio : {aspect_ratio} ({size_label})
+• Layout       : {layout_hint}
+{intent_line}
+{brand_line}
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RETAIL HERO BANNER PRINCIPLES — follow ALL strictly:
 
+1. HEADLINE (MANDATORY)
+- One bold, attention-grabbing headline (max 8–10 words)
+- Must reflect campaign theme + product value
+- Example styles: offer-driven, benefit-driven, seasonal
+- Placed prominently over image
 
+2. CAPTION (MANDATORY)
+- One concise supporting line
+- Reinforces value (discount, quality, lifestyle benefit)
+- Positioned directly below headline
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import {
-  AlertCircle,
-  Check,
-  Download,
-  ImagePlus,
-  Loader,
-  Plus,
-  Sparkles,
-  Trash2,
-  Wand2,
-  X,
-} from 'lucide-react';
-import { middleware_url } from '../../utils/constants';
+3. BACKGROUND IMAGE (MANDATORY)
+- Full-bleed, high-quality lifestyle or product-centric scene
+- Must reflect:
+  → product usage OR
+  → seasonal/campaign context (e.g., Christmas setup, school desk, summer beach)
+- Should feel aspirational and purchase-driven
+- No plain backgrounds, no abstract-only visuals
 
-// ---------------------------------------------------------------------------
-// Template gallery
-// ---------------------------------------------------------------------------
-//
-// Templates live only on the backend now (batch_process/.../hls_platform/
-// assets/Templates) — this used to also bundle its own local copy via
-// import.meta.glob, which meant two folders had to be kept in sync by
-// hand. That was the source of most of the "unknown template" errors this
-// feature hit early on. Fetching from the backend at runtime means there
-// is exactly one place templates live, and add/delete here immediately
-// reflects in what a banner can actually be generated from.
+4. PRODUCT VISIBILITY
+- Product must be clearly visible OR strongly implied in usage scene
+- Can include:
+  → hero product shot
+  → lifestyle usage (e.g., person using product naturally)
 
-interface BannerTemplate {
-  id: string;
-  name: string;
-  image_url: string;
-}
+5. TEXT OVERLAY DESIGN
+- Clean overlay (left/center aligned depending on layout)
+- Strong contrast using gradient overlay or soft shadow
+- No clutter
 
-function templateImageUrl(template: BannerTemplate, width?: number): string {
-  const base = `${middleware_url}${template.image_url}`;
-  return width ? `${base}?w=${width}` : base;
-}
+6. PRODUCT GROUP EMPHASIS
+- Clearly include multiple school essentials:
+  → school bag
+  → notebooks
+  → stationery (pencils, erasers)
+  → uniform elements (tie, belt, shoes)
+- Products should be visible and identifiable in the scene
 
-// Matches BANNER_SIZES in banner.py — Gemini's full supported ratio set,
-// not a narrower guess of my own. Keeping these two lists in the same
-// order/values as that dict means a template's detected native ratio can
-// never point at a value the dropdown doesn't actually offer.
-const COMMON_RATIOS: Record<string, number> = {
-  '1:1': 1,
-  '3:2': 3 / 2,
-  '2:3': 2 / 3,
-  '3:4': 3 / 4,
-  '4:3': 4 / 3,
-  '4:5': 4 / 5,
-  '5:4': 5 / 4,
-  '9:16': 9 / 16,
-  '16:9': 16 / 9,
-  '21:9': 21 / 9,
-};
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VISUAL & QUALITY STANDARDS:
 
-function nearestAspectRatio(width: number, height: number): string {
-  const actual = width / height;
-  let best = '16:9';
-  let bestDelta = Infinity;
-  for (const [label, ratio] of Object.entries(COMMON_RATIOS)) {
-    const delta = Math.abs(ratio - actual);
-    if (delta < bestDelta) {
-      best = label;
-      bestDelta = delta;
-    }
-  }
-  return best;
-}
+• Ultra high-resolution, sharp ecommerce-quality output
+• Modern retail aesthetic (premium, aspirational, conversion-focused)
+• Lighting: bright, natural, high clarity
+• Colors:
+  - Follow brand palette if available
+  - Otherwise use max 3–4 harmonious retail colors
+• Typography:
+  - Clean sans-serif
+  - Bold headline, lighter supporting text
+• If humans present:
+  - Natural posture, realistic proportions
+  - No distortions, no extra limbs, no blur
+• Depth:
+  - Soft shadows, layered composition, foreground + background separation
 
-const aspectRatioOptions = [
-  { value: '1:1', label: '1:1 · Square' },
-  { value: '3:2', label: '3:2 · Standard landscape' },
-  { value: '2:3', label: '2:3 · Standard portrait' },
-  { value: '3:4', label: '3:4 · Portrait' },
-  { value: '4:3', label: '4:3 · Landscape' },
-  { value: '4:5', label: '4:5 · Tall square' },
-  { value: '5:4', label: '5:4 · Wide square' },
-  { value: '9:16', label: '9:16 · Story / skyscraper' },
-  { value: '16:9', label: '16:9 · Widescreen' },
-  { value: '21:9', label: '21:9 · Ultra widescreen' },
-] as const;
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMERCIAL BEST PRACTICES:
 
-interface HistoryItem {
-  title: string;
-  time: string;
-  image: string;
-}
+• Emphasize:
+  - Offers (discounts, limited-time deals)
+  - Seasonal relevance
+  - Lifestyle aspiration
+• Ensure:
+  - Visual hierarchy drives attention to headline → product → CTA
+  - All text is grammatically correct and free of spelling errors
+• Avoid:
+  - Overcrowding
+  - Too many elements
+  - Generic stock feel
 
-interface SalesBannerGeneratorProps {
-  /** Called when the modal is dismissed (X, Cancel). Either prop works. */
-  onClose?: () => void;
-  onBack?: () => void;
-  /**
-   * Set to false if you render this inside an existing modal/dialog wrapper,
-   * so it doesn't add a second full-screen overlay of its own.
-   */
-  overlay?: boolean;
-}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT RULES:
 
-const labelClass = 'mb-1 block text-[11px] font-semibold uppercase tracking-wider text-slate-500';
+• Return ONLY the final image-generation prompt
+• No explanations, no markdown
+• Must include:
+  - Exact headline text
+  - Caption text
+  - Full background scene description
+  - Product placement description
+  - Lighting and color direction
+  - Aspect ratio: {aspect_ratio}
+  {logo_line}
 
-const inputClass =
-  'w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-900 transition focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600';
+Generate the hero banner prompt now.
+"""
+    response = llm.invoke(prompt)
+    image_prompt = response.content.strip()
+    print(f"🎨 Hero banner prompt ({aspect_ratio} — {size_label}):\n{image_prompt[:300]}...")
+    return image_prompt
 
-function readFileAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
-    reader.onerror = () => reject(new Error('Failed to read image file'));
-    reader.readAsDataURL(file);
-  });
-}
+async def retail_workflow_banner(campaign_type, brand_data, db: AsyncSession, output_folder=None,
+                  domain=None, user_id=None, user_name=None,
+                  transaction_uuid=None, input_folder=None, banner_options=None, workflow_meta=None):
 
-export function SalesBannerGenerator({ onClose, onBack, overlay = true }: SalesBannerGeneratorProps) {
-  const handleClose = onClose ?? onBack ?? (() => {});
+    print("\n🎨 Generating Hero Banner for retail content factory workflow...\n")
 
-  // Template list now comes from the backend — the single source of
-  // truth. Fetched on mount; add/delete both re-fetch so the grid never
-  // shows stale state.
-  const [templates, setTemplates] = useState<BannerTemplate[]>([]);
-  const [templatesLoading, setTemplatesLoading] = useState(true);
-  const [templatesError, setTemplatesError] = useState<string | null>(null);
-  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
+    try:
+        import uuid
+        sys_type, sys_path = getOSpecifiers()
+        if sys_type == 'linux':
+            print("iam in linux")
+            hls_uploads_path =  "/apps/ebuddy/hls_uploads"
+        else:
+            print("iam in windows")
+            hls_uploads_path = os.path.join(os.getcwd(),"src", "hls_uploads") 
 
-  async function fetchTemplates(selectId?: string) {
-    setTemplatesLoading(true);
-    setTemplatesError(null);
-    try {
-      const token = localStorage.getItem('token');
-      const response = await fetch(`${middleware_url}/batch_process/sales_platform/banner/templates`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await response.json();
-      if (!response.ok || data.success === false) {
-        throw new Error(data.error || data.detail || 'Could not load templates');
-      }
-      const list: BannerTemplate[] = data.templates || [];
-      setTemplates(list);
-      setSelectedTemplateId((current) => {
-        if (selectId && list.some((t) => t.id === selectId)) return selectId;
-        if (current && list.some((t) => t.id === current)) return current;
-        return list[0]?.id ?? null;
-      });
-    } catch (err) {
-      setTemplatesError(err instanceof Error ? err.message : 'Could not load templates');
-    } finally {
-      setTemplatesLoading(false);
-    }
-  }
+        os.makedirs(hls_uploads_path, exist_ok=True)
+        uuid_path = os.path.join(hls_uploads_path, transaction_uuid)
+        input_folder = os.path.join(uuid_path, "input_folder")
+        output_folder = os.path.join(uuid_path, "output_folder")
+        
+        os.makedirs(input_folder, exist_ok=True)
+        os.makedirs(output_folder, exist_ok=True)
 
-  useEffect(() => {
-    void fetchTemplates();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+        banner_options = banner_options or {}
+        size_str = banner_options.get("size", "16:9")
+        intent = banner_options.get('intent')
+        country = banner_options.get('country') 
+        brand_name = banner_options.get("brand_guidelines", "")
 
-  // Upload state — the "+" tile at the end of the grid
-  const [uploading, setUploading] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const uploadInputRef = useRef<HTMLInputElement>(null);
+        aspect_ratio, size_label = get_aspect_ratio(size_str)
+        print(f"📐 Aspect ratio: {aspect_ratio} ({size_label})")
 
-  async function handleUploadTemplate(file: File | null) {
-    if (!file) return;
-    if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(file.type)) {
-      setUploadError('Only PNG, JPG, or WEBP files are supported');
-      return;
-    }
-    if (file.size > 15 * 1024 * 1024) {
-      setUploadError('Image must be under 15MB');
-      return;
-    }
-    setUploading(true);
-    setUploadError(null);
-    try {
-      const dataUrl = await readFileAsDataUrl(file);
-      const token = localStorage.getItem('token');
-      const name = file.name.replace(/\.[^./]+$/, '');
-      const response = await fetch(`${middleware_url}/batch_process/sales_platform/banner/templates`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ name, image: dataUrl }),
-      });
-      const data = await response.json();
-      if (!response.ok || data.success === false) {
-        throw new Error(data.error || data.detail || 'Upload failed');
-      }
-      await fetchTemplates(data.template?.id);
-    } catch (err) {
-      setUploadError(err instanceof Error ? err.message : 'Upload failed');
-    } finally {
-      setUploading(false);
-      if (uploadInputRef.current) uploadInputRef.current.value = '';
-    }
-  }
+        # brand_name may be "Brand Name - color palette info"; extract just the name for logo lookup
+        brand_name_only = brand_name.split(' - ', 1)[0].strip() if brand_name else ''
+        logo_bytes, logo_mime = await get_brand_logo_bytes(brand_name_only, db) if brand_name_only else (None, '')
+        if logo_bytes:
+            print(f"🏷️  Brand logo loaded for '{brand_name_only}'")
+        else:
+            print(f"ℹ️  No brand logo — generating without logo")
 
-  // Delete state — bin icon on each card
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
+        CAMPAIGN_CONTENT_MAP = {
+            "Back to School": """
+            Back-to-school campaign focused on young school children (Grades KG to 8).
 
-  async function handleDeleteTemplate(templateId: string, templateName: string) {
-    if (!window.confirm(`Delete "${templateName}"? This can't be undone.`)) return;
-    setDeletingId(templateId);
-    setDeleteError(null);
-    try {
-      const token = localStorage.getItem('token');
-      const response = await fetch(
-        `${middleware_url}/batch_process/sales_platform/banner/templates/${encodeURIComponent(templateId)}`,
-        { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } },
-      );
-      const data = await response.json();
-      if (!response.ok || data.success === false) {
-        throw new Error(data.error || data.detail || 'Delete failed');
-      }
-      await fetchTemplates();
-    } catch (err) {
-      setDeleteError(err instanceof Error ? err.message : 'Delete failed');
-    } finally {
-      setDeletingId(null);
-    }
-  }
+            Target audience:
+            - Kids aged 4 to 14
+            - Parents shopping for school essentials
 
-  // Core banner fields
-  const [title, setTitle] = useState('');
-  const [description, setDescription] = useState('');
-  const [aspectRatio, setAspectRatio] = useState<string>('16:9');
-  const [aspectTouched, setAspectTouched] = useState(false);
-  const [prompt, setPrompt] = useState('');
+            Products included:
+            - School bags (colorful, lightweight)
+            - School shoes (black formal)
+            - Notebooks and stationery
+            - Pencils, pens, erasers
+            - Compass boxes
+            - School uniforms
+            - Belts, ties, socks
 
-  // Optional photo — if left empty, the backend keeps the person already
-  // baked into the template.
-  const [photo, setPhoto] = useState<string | null>(null);
-  const [photoError, setPhotoError] = useState<string | null>(null);
+            STRICT EXCLUSIONS:
+            - No laptops
+            - No college or office setups
+            - No older teenagers
 
-  // UI state
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [history, setHistory] = useState<HistoryItem[]>([]);
-  // Captured from the X-Transaction-UUID response header. Not used yet —
-  // your banner.py already has a refine-by-feedback flow keyed on this
-  // (handle_banner_refine); if you want the "Anything else to change?"
-  // field to hit that instead of a full regenerate, this is what a
-  // /banner/refine call would need.
-  const [lastTransactionId, setLastTransactionId] = useState<string | null>(null);
+            Visual direction:
+            - Show young school children in uniform
+            - Classroom or home study environment
+            - Bright, colorful, cheerful setup
+            - Multiple school items visible (bags, notebooks, stationery)
 
-  // Object URLs from generated blobs need explicit cleanup, but history
-  // thumbnails reference the same URLs as past previews — revoking on
-  // every previewUrl change would break old history entries the moment a
-  // second banner is generated. Track everything created this session and
-  // revoke it only when the modal itself unmounts.
-  const objectUrlsRef = useRef<string[]>([]);
-  useEffect(() => {
-    return () => {
-      objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-    };
-  }, []);
+            Messaging focus:
+            - School readiness
+            - Fun learning
+            - Smart shopping for essentials
+            - Value deals for parents
 
-  // Native aspect ratio per template, probed client-side by loading each
-  // image once. Populates progressively; a template selected before its
-  // probe resolves just keeps the current aspect ratio until it does.
-  const [nativeRatios, setNativeRatios] = useState<Record<string, string>>({});
+            Regional context:
+            - Adapt visual elements and messaging to local {country} school culture
+            - Use region-appropriate uniforms, school settings, and seasonal context
+            - Consider local holidays and school calendar timing
+            """,
 
-  useEffect(() => {
-    let cancelled = false;
-    templates.forEach((template) => {
-      if (nativeRatios[template.id]) return; // already probed
-      const img = new Image();
-      img.onload = () => {
-        if (cancelled) return;
-        const ratio = nearestAspectRatio(img.naturalWidth, img.naturalHeight);
-        setNativeRatios((prev) => ({ ...prev, [template.id]: ratio }));
-      };
-      img.src = templateImageUrl(template, 300);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [templates]);
+            "Halloween": """
+        Halloween campaign focuses on spooky, fun, and festive shopping experiences.
+        Products include costumes, decorations, snacks, party supplies, and themed items.
+        Messaging should highlight excitement, creativity, and limited-time spooky deals.
+        Tone: playful, mysterious, and fun.
+        Common themes: trick-or-treat, spooky vibes, scary discounts, festive preparation.
+        """,
 
-  const selectedTemplate = useMemo(
-    () => templates.find((t) => t.id === selectedTemplateId) ?? null,
-    [templates, selectedTemplateId],
-  );
-
-  // Once a template's native ratio resolves, adopt it as the default —
-  // unless the user already deliberately picked a different one.
-  useEffect(() => {
-    if (!selectedTemplateId || aspectTouched) return;
-    const ratio = nativeRatios[selectedTemplateId];
-    if (ratio) setAspectRatio(ratio);
-  }, [selectedTemplateId, nativeRatios, aspectTouched]);
-
-  function selectTemplate(template: BannerTemplate) {
-    setSelectedTemplateId(template.id);
-    if (!aspectTouched && nativeRatios[template.id]) {
-      setAspectRatio(nativeRatios[template.id]);
-    }
-  }
-
-  async function handlePhotoUpload(file: File | null) {
-    if (!file) return;
-    if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(file.type)) {
-      setPhotoError('Only PNG, JPG, or WEBP files are supported');
-      return;
-    }
-    if (file.size > 10 * 1024 * 1024) {
-      setPhotoError('Image size must be under 10MB');
-      return;
-    }
-    try {
-      setPhoto(await readFileAsDataUrl(file));
-      setPhotoError(null);
-    } catch {
-      setPhotoError('Failed to read image file');
-    }
-  }
-
-  async function generateBanner() {
-    if (!selectedTemplateId) {
-      setError('Pick a template first');
-      return;
-    }
-    if (!title.trim() && !description.trim() && !prompt.trim()) {
-      setError('Add a title, description, or instruction so there is something to change');
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      const token = localStorage.getItem('token');
-      const payload = {
-        template_id: selectedTemplateId,
-        title: title.trim(),
-        description: description.trim(),
-        prompt: prompt.trim(),
-        aspect_ratio: aspectRatio,
-        photo, // null keeps the person already in the template
-      };
-
-      const response = await fetch(
-        `${middleware_url}/batch_process/sales_platform/banner/generate`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify(payload),
-        },
-      );
-
-      if (!response.ok) {
-        // Error responses are JSON ({"success": false, "error": "..."}),
-        // even though a successful response is raw image bytes.
-        let message = 'Banner generation failed';
-        try {
-          const errBody = await response.json();
-          message = errBody.detail || errBody.error || errBody.message || message;
-        } catch {
-          /* response wasn't JSON either — keep the generic message */
+            "Christmas": """
+        Christmas campaign emphasizes gifting, celebration, and holiday spirit.
+        Products include gifts, decorations, winter clothing, electronics, and toys.
+        Messaging should focus on giving, family, joy, and festive savings.
+        Tone: warm, emotional, and celebratory.
+        Common themes: holiday gifting, joy, togetherness, festive offers.
+        """
         }
-        throw new Error(message);
-      }
 
-      const blob = await response.blob();
-      if (blob.size === 0) throw new Error('No banner image returned by the server');
+        document_content = CAMPAIGN_CONTENT_MAP.get(campaign_type, "").format(country=country)
 
-      const bannerImage = URL.createObjectURL(blob);
-      objectUrlsRef.current.push(bannerImage);
-      const transactionId = response.headers.get('X-Transaction-UUID');
-      setPreviewUrl(bannerImage);
-      setLastTransactionId(transactionId);
+        # Step 1: LLM generates image prompt
+        llm = await initialize_5o_mini_llm(
+            db=db,
+            domain='retail'
+        )
+        image_prompt = generate_hero_banner_prompt_for_retail(
+            llm, document_content, aspect_ratio, size_label,
+            intent=intent, brand_name="", has_logo=""
+        )
 
-      setHistory((prev) =>
-        [
-          {
-            title: title.trim() || selectedTemplate?.name || 'Banner',
-            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            image: bannerImage,
-          },
-          ...prev,
-        ].slice(0, 6),
-      );
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to generate banner');
-    } finally {
-      setLoading(false);
-    }
-  }
+        # Step 2: Gemini generates image
+        logo_bytes = None
+        image_data = await generate_banner_image(image_prompt, db, logo_bytes, logo_mime)
+        if not image_data:
+            raise ValueError("No image data returned from Gemini")
 
-  function downloadBanner() {
-    if (!previewUrl) return;
-    const link = document.createElement('a');
-    link.href = previewUrl;
-    link.download = `sales-banner-${Date.now()}.png`;
-    link.click();
-  }
+        # Save file
+        os.makedirs(output_folder, exist_ok=True)
 
-  const card = (
-    <div className="flex max-h-[94vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl bg-white text-sm text-slate-900 antialiased shadow-2xl">
-      {/* ===== Header ===== */}
-      <div className="flex items-center justify-between px-5 py-3">
-        <div>
-          <div className="text-lg font-bold leading-tight text-slate-900">Banner Generator</div>
-          <div className="mt-0.5 text-xs leading-tight text-slate-500">
-            Edits one of the approved templates — layout and logo stay locked
-          </div>
-        </div>
-        <button
-          type="button"
-          onClick={handleClose}
-          aria-label="Close"
-          className="rounded-md p-1 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
-        >
-          <X size={18} />
-        </button>
-      </div>
-      <div className="border-b border-blue-100" />
+        ratio_tag     = aspect_ratio.replace(':', 'x')
+        format_part   = campaign_type.replace(' ', '_')
+        base_filename = f"{format_part}_{ratio_tag}"
 
-      {/* ===== Scrollable body ===== */}
-      <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
-        {/* Template picker */}
-        <section>
-          <div className="mb-2 flex items-center justify-between">
-            <div className="text-sm font-semibold leading-tight text-slate-900">
-              Choose a template
-            </div>
-            {templatesLoading && (
-              <span className="flex items-center gap-1 text-[11px] text-slate-400">
-                <Loader size={11} className="animate-spin" />
-                Loading…
-              </span>
-            )}
-          </div>
+        counter   = 1
+        file_name = f"{base_filename}.png"
+        file_path = os.path.join(output_folder, file_name)
+        while os.path.exists(file_path):
+            counter  += 1
+            file_name = f"{base_filename}_{counter}.png"
+            file_path = os.path.join(output_folder, file_name)
 
-          {templatesError && (
-            <div className="mb-2 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 p-2.5">
-              <AlertCircle size={15} className="mt-0.5 flex-shrink-0 text-red-600" />
-              <p className="text-xs font-medium text-red-900">{templatesError}</p>
-            </div>
-          )}
+        image = Image.open(io.BytesIO(image_data))
+        image.save(file_path, 'PNG')
+        print(f"✅ Banner saved: {file_path}")
 
-          {deleteError && (
-            <div className="mb-2 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 p-2.5">
-              <AlertCircle size={15} className="mt-0.5 flex-shrink-0 text-red-600" />
-              <p className="text-xs font-medium text-red-900">{deleteError}</p>
-            </div>
-          )}
+        with open(file_path, 'rb') as f:
+            final_image_data = f.read()
 
-          {!templatesLoading && !templatesError && templates.length === 0 && (
-            <p className="mb-2 text-xs text-slate-500">
-              No templates yet — use the tile below to add the first one.
-            </p>
-          )}
+        return Response(
+            content=final_image_data,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "X-Transaction-UUID": str(transaction_uuid),
+                "Access-Control-Expose-Headers": "X-Transaction-UUID",
+            },
+        )
 
-          <div className="grid grid-cols-3 gap-2.5 sm:grid-cols-4">
-            {templates.map((template) => {
-              const active = template.id === selectedTemplateId;
-              const isDeleting = deletingId === template.id;
-              return (
-                <div
-                  key={template.id}
-                  className={`group relative overflow-hidden rounded-lg border-2 transition ${
-                    active
-                      ? 'border-blue-600 ring-2 ring-blue-100'
-                      : 'border-slate-200 hover:border-blue-300'
-                  }`}
-                >
-                  <button
-                    type="button"
-                    onClick={() => selectTemplate(template)}
-                    disabled={isDeleting}
-                    className="block w-full text-left"
-                  >
-                    <img
-                      src={templateImageUrl(template, 300)}
-                      alt={template.name}
-                      className={`aspect-[4/3] w-full object-cover ${isDeleting ? 'opacity-40' : ''}`}
-                      loading="lazy"
-                    />
-                    {active && (
-                      <span className="absolute right-1 top-1 rounded-full bg-blue-600 p-0.5 text-white">
-                        <Check size={11} />
-                      </span>
-                    )}
-                    <span className="block truncate bg-white px-1.5 py-1 text-[10.5px] font-medium text-slate-700">
-                      {template.name}
-                    </span>
-                  </button>
+    except Exception as e:
+        logger.error(f"Error in handle_banner: {e}")
+        print(f"❌ Hero banner generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500,
+        )
+    
 
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void handleDeleteTemplate(template.id, template.name);
-                    }}
-                    disabled={isDeleting}
-                    aria-label={`Delete ${template.name}`}
-                    title={`Delete ${template.name}`}
-                    className="absolute left-1 top-1 rounded-full bg-white/90 p-1 text-slate-500 opacity-0 shadow-sm transition hover:bg-red-50 hover:text-red-600 group-hover:opacity-100 disabled:opacity-100"
-                  >
-                    {isDeleting ? (
-                      <Loader size={11} className="animate-spin" />
-                    ) : (
-                      <Trash2 size={11} />
-                    )}
-                  </button>
-                </div>
-              );
-            })}
+#Code for parsing guardrails and validating banner copy against them for multiple brands in retail context
+async def retail_workflow_banner_brands(
+    campaign_type,
+    brand_data,
+    output_folder=None,
+    domain=None,
+    user_id=None,
+    user_name=None,
+    transaction_uuid=None,
+    input_folder=None,
+    banner_options=None,
+    workflow_meta=None,
+    db: AsyncSession = None,
+):
 
-            {/* "+" tile — add a new template/golden sample */}
-            <label
-              className={`flex aspect-[4/3] cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed text-slate-400 transition hover:border-blue-400 hover:text-blue-600 ${
-                uploading ? 'pointer-events-none opacity-60' : 'border-slate-300'
-              }`}
-            >
-              {uploading ? (
-                <Loader size={18} className="animate-spin" />
-              ) : (
-                <Plus size={18} />
-              )}
-              <span className="text-[10.5px] font-medium">
-                {uploading ? 'Uploading…' : 'Add template'}
-              </span>
-              <input
-                ref={uploadInputRef}
-                type="file"
-                accept="image/*"
-                className="sr-only"
-                onChange={(e) => void handleUploadTemplate(e.target.files?.[0] || null)}
-              />
-            </label>
-          </div>
+    print("\n🎨 Generating Hero Banner for each brand in retail content factory workflow...\n")
+    print(f"Received brand data: {brand_data}")
 
-          {uploadError && <p className="mt-1.5 text-[11px] text-red-600">{uploadError}</p>}
-        </section>
+    output_file_paths = []  # Collect all banner paths here
 
-        <br />
+    try:
+        import uuid
+        sys_type, sys_path = getOSpecifiers()
+        if sys_type == 'linux':
+            print("iam in linux")
+            hls_uploads_path =  "/apps/ebuddy/hls_uploads"
+        else:
+            print("iam in windows")
+            hls_uploads_path = os.path.join(os.getcwd(),"src", "hls_uploads") 
 
-        {/* Banner content */}
-        <section>
-          <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">
-            Banner content
-          </div>
-          <div className="space-y-3">
-            <div>
-              <label className={labelClass}>Title</label>
-              <input
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="e.g., Q3 Sales Champion"
-                className={inputClass}
-              />
-            </div>
-            <div>
-              <label className={labelClass}>Description</label>
-              <textarea
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                placeholder="e.g., Congratulations on closing the year with record numbers"
-                className={`${inputClass} min-h-[48px] resize-none`}
-              />
-            </div>
-          </div>
-        </section>
+        os.makedirs(hls_uploads_path, exist_ok=True)
+        uuid_path = os.path.join(hls_uploads_path, transaction_uuid)
+        input_folder = os.path.join(uuid_path, "input_folder")
+        output_folder = os.path.join(uuid_path, "output_folder")
+        
+        os.makedirs(input_folder, exist_ok=True)
+        os.makedirs(output_folder, exist_ok=True)
 
-        <br />
+        banner_options = banner_options or {}
+        size_str = banner_options.get("size", "16:9")
+        intent = banner_options.get('intent')
+        country = banner_options.get('country') 
+        brand_name = banner_options.get("brand_guidelines", "")
 
-        {/* Photo + aspect ratio */}
-        <section>
-          <div className="mb-2 text-sm font-semibold leading-tight text-slate-900">
-            Person &amp; format
-          </div>
-          <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
-            <div>
-              <label className={labelClass}>Photo</label>
-              {photo ? (
-                <div className="flex items-center gap-2.5">
-                  <img
-                    src={photo}
-                    alt="Uploaded"
-                    className="h-11 w-11 rounded-md border border-slate-200 object-cover"
-                  />
-                  <span className="text-xs text-slate-500">Will replace the template's photo</span>
-                  <button
-                    type="button"
-                    onClick={() => setPhoto(null)}
-                    className="ml-auto rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 transition hover:border-red-400 hover:text-red-600"
-                  >
-                    Remove
-                  </button>
-                </div>
-              ) : (
-                <label className="flex cursor-pointer items-center gap-2.5">
-                  <span className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:border-blue-500 hover:text-blue-700">
-                    <ImagePlus size={13} />
-                    Choose file
-                  </span>
-                  <input
-                    type="file"
-                    accept="image/*"
-                    className="sr-only"
-                    onChange={(e) => void handlePhotoUpload(e.target.files?.[0] || null)}
-                  />
-                </label>
-              )}
-              <p className="mt-1 text-[11px] leading-snug text-slate-500">
-                Optional — leave empty to keep the person already in the template.
-              </p>
-              {photoError && <p className="mt-1 text-[11px] text-red-600">{photoError}</p>}
-            </div>
+        aspect_ratio, size_label = get_aspect_ratio(size_str)
+        print(f"brand data : {brand_data}")
+        print(f"📐 Aspect ratio: {aspect_ratio} ({size_label})")
 
-            <div>
-              <label className={labelClass}>Aspect ratio</label>
-              <div className="relative">
-                <select
-                  value={aspectRatio}
-                  onChange={(e) => {
-                    setAspectRatio(e.target.value);
-                    setAspectTouched(true);
-                  }}
-                  className="w-full cursor-pointer appearance-none rounded-md border border-slate-300 bg-white px-2.5 py-1.5 pr-8 text-sm text-slate-900 transition focus:border-blue-600 focus:outline-none focus:ring-1 focus:ring-blue-600"
-                >
-                  {aspectRatioOptions.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              {selectedTemplateId && nativeRatios[selectedTemplateId] && (
-                <p className="mt-1 text-[11px] leading-snug text-slate-500">
-                  Template's native ratio is {nativeRatios[selectedTemplateId]}.
-                </p>
-              )}
-            </div>
-          </div>
-        </section>
+        logo_bytes, logo_mime = None, ''
 
-        <br />
+        CAMPAIGN_CONTENT_MAP = {
+            "Back to School": """
+            Back-to-school campaign focused on young school children (Grades KG to 8).
 
-        {/* Prompt */}
-        <section>
-          <div className="mb-2 flex items-center gap-1.5 text-sm font-semibold leading-tight text-slate-900">
-            <Wand2 size={15} className="text-blue-600" />
-            Anything else to change?
-          </div>
-          <textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Optional — e.g., make the confetti more subtle, use a cooler colour tone"
-            className={`${inputClass} min-h-[48px] resize-none`}
-          />
-          <p className="mt-1 text-[11px] leading-snug text-slate-500">
-            Everything else in the template — logo, layout, colours — stays exactly as designed
-            unless you mention it here.
-          </p>
-        </section>
+            Target audience:
+            - Kids aged 4 to 14
+            - Parents shopping for school essentials
 
-        {/* Preview */}
-        {previewUrl && (
-          <section>
-            <div className="mb-2 flex items-center justify-between">
-              <div className="text-sm font-semibold leading-tight text-slate-900">Preview</div>
-              <button
-                type="button"
-                onClick={downloadBanner}
-                className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
-              >
-                <Download size={13} />
-                Download PNG
-              </button>
-            </div>
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">
-              <img
-                src={previewUrl}
-                alt="Generated banner"
-                className="mx-auto max-h-[280px] w-full rounded-md object-contain shadow-sm"
-              />
-              {lastTransactionId && (
-                <p className="mt-1.5 text-center text-[10px] text-slate-400">
-                  Ref {lastTransactionId.slice(0, 8)}
-                </p>
-              )}
-            </div>
+            STRICT EXCLUSIONS:
+            - No laptops
+            - No college or office setups
+            - No older teenagers
 
-            {history.length > 0 && (
-              <div className="mt-3">
-                <p className="mb-1.5 text-xs text-slate-600">Recent banners</p>
-                <div className="grid grid-cols-3 gap-2">
-                  {history.map((item, idx) => (
-                    <button
-                      key={idx}
-                      type="button"
-                      onClick={() => setPreviewUrl(item.image)}
-                      className="group relative overflow-hidden rounded-md border border-slate-200 transition hover:border-blue-500"
-                    >
-                      <img src={item.image} alt={item.title} className="h-14 w-full object-cover" />
-                      <div className="absolute inset-0 flex items-end bg-black/0 p-1.5 transition group-hover:bg-black/30">
-                        <span className="truncate text-[10px] font-semibold text-white opacity-0 transition group-hover:opacity-100">
-                          {item.title}
-                        </span>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-          </section>
-        )}
+            Visual direction:
+            - Show young school children in uniform
+            - Classroom or home study environment
+            - Bright, colorful, cheerful setup
+            - Multiple school items visible (bags, notebooks, stationery)
 
-        {error && (
-          <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50 p-2.5">
-            <AlertCircle size={15} className="mt-0.5 flex-shrink-0 text-red-600" />
-            <p className="text-xs font-medium text-red-900">{error}</p>
-          </div>
-        )}
-      </div>
+            Messaging focus:
+            - School readiness
+            - Fun learning
+            - Smart shopping for essentials
+            - Value deals for parents
 
-      {/* ===== Footer ===== */}
-      <div className="flex items-center justify-between border-t border-slate-200 px-5 py-2.5">
-        <button
-          type="button"
-          onClick={handleClose}
-          className="rounded-md px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
-        >
-          Cancel
-        </button>
-        <button
-          type="button"
-          onClick={generateBanner}
-          disabled={loading || !selectedTemplateId}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-indigo-500 to-blue-600 px-4 py-2 text-sm font-semibold text-white shadow transition hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {loading ? (
-            <>
-              <Loader size={14} className="animate-spin" />
-              Generating…
-            </>
-          ) : (
-            <>
-              <Sparkles size={14} />
-              Generate Banner
-            </>
-          )}
-        </button>
-      </div>
-    </div>
-  );
+            Regional context:
+            - Adapt visual elements and messaging to local {country} school culture
+            - Use region-appropriate uniforms, school settings, and seasonal context
+            - Consider local holidays and school calendar timing
+            """,
 
-  if (!overlay) {
-    return card;
-  }
+            "Halloween": """
+        Halloween campaign focuses on spooky, fun, and festive shopping experiences.
+        Products include costumes, decorations, snacks, party supplies, and themed items.
+        Messaging should highlight excitement, creativity, and limited-time spooky deals.
+        Tone: playful, mysterious, and fun.
+        Common themes: trick-or-treat, spooky vibes, scary discounts, festive preparation.
+        """,
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-3">
-      {card}
-    </div>
-  );
-}
+            "Christmas": """
+        Christmas campaign emphasizes gifting, celebration, and holiday spirit.
+        Products include gifts, decorations, winter clothing, electronics, and toys.
+        Messaging should focus on giving, family, joy, and festive savings.
+        Tone: warm, emotional, and celebratory.
+        Common themes: holiday gifting, joy, togetherness, festive offers.
+        """
+        }
 
+        document_content = CAMPAIGN_CONTENT_MAP.get(campaign_type, "").format(country=country)
+        llm = await initialize_5o_mini_llm(db=db, domain='retail')
+        for brand_obj in brand_data['brand_knowledge']:  # loop through all brands, remove [:2] to process all brands instead of just first 2
+            try:
+                ctx = {
+                    'name': brand_obj.get('brand_name'),
+                    'tone': brand_obj.get('tone'),
+                    'guardrails': brand_obj.get('guardrails'),
+                    'category': brand_obj.get('category'),
+                    'focus_intent': brand_obj.get('focus_intent'),
+                }
+
+                # Step 1: LLM generates image prompt
+                image_prompt, valid, violations = await asyncio.to_thread(
+                    generate_hero_banner_prompt_for_retail_with_brand,
+                    llm,
+                    document_content,
+                    aspect_ratio,
+                    size_label,
+                    intent,
+                    brand_context=ctx,
+                )
+
+                # Step 2: Gemini generates image
+                logo_bytes = None
+                image_data = await generate_banner_image(image_prompt, db, logo_bytes, logo_mime)
+                if not image_data:
+                    logger.info(f"No image data returned from Gemini for brand {ctx['name']}")
+                    continue  # Skip to next brand instead of failing entire workflow
+
+                # Save file
+                os.makedirs(output_folder, exist_ok=True)
+
+                # ratio_tag     = aspect_ratio.replace(':', 'x')
+                format_part   = campaign_type.replace(' ', '_')
+                base_filename = f"{ctx['name']}_{format_part}"
+
+                file_name = f"{base_filename}.png"
+                file_path = os.path.join(output_folder, file_name)
+
+                image = Image.open(io.BytesIO(image_data))
+                image.save(file_path, 'PNG')
+                print(f"✅ Banner saved: {file_path} for brand {ctx['name']}")
+
+                # Collect successful output path
+                output_file_paths.append(os.path.abspath(file_path))
+            except Exception as brand_e:
+                logger.error(f"Error processing brand {ctx['name']}: {brand_e}")
+                print(f"❌ Error processing brand {ctx['name']}: {brand_e}")
+                continue
+
+        # Save DB transaction
+        if user_id and transaction_uuid:
+            logger.info(f"Starting DB save for transaction {transaction_uuid} with output paths: {output_file_paths}")
+            try:
+                output_file_path_json = json.dumps(output_file_paths)  # Serialize all paths
+                wf = workflow_meta or {}
+                db.add(HLSTransaction(
+                    uuid=transaction_uuid,
+                    format_type='banner',
+                    input_file_paths='',
+                    output_file_path=output_file_path_json,
+                    created_by=str(user_id),
+                    created_person=str(user_name),
+                    domain=domain,
+                    is_workflow=bool(wf.get('is_workflow', False)),
+                    workflow_type=wf.get('workflow_type'),
+                    workflow_run_id=wf.get('workflow_run_id'),
+                    workflow_step_name=wf.get('workflow_step_name'),
+                ))
+                await db.commit()
+                print(f"✅ Transaction saved: {transaction_uuid}")
+            except Exception as db_error:
+                logger.error(f"Error saving transaction {transaction_uuid}: {db_error}")
+                await db.rollback()
+    except Exception as e:
+        logger.error(f"Error in retail_workflow_banner_brands: {e}")
+        print(f"❌ Retail workflow banner generation failed: {e}")
+
+        import traceback
+        traceback.print_exc()
+
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500,
+        )
+    
+
+def parse_guardrails(guardrails_text: str) -> dict:
+    """
+    Parse guardrails text into structured format.
+    
+    Splits guardrails by "Universal:" and "Brand:" markers, then by semicolons or newlines.
+    
+    Args:
+        guardrails_text: Guardrails as single string or newline-separated list
+    
+    Returns:
+        Dict with 'universal' and 'brand' keys, each containing list of rules
+    
+    Example:
+        >>> text = "Universal: No academic claims; No health claims. Brand: Avoid casual slang."
+        >>> rules = parse_guardrails(text)
+        >>> rules['universal']
+        ['No academic claims', 'No health claims']
+        >>> rules['brand']
+        ['Avoid casual slang']
+    """
+    try:
+        result = {'universal': [], 'brand': []}
+        
+        if not guardrails_text:
+            return result
+        
+        # Split by "Universal:" and "Brand:" markers
+        parts = guardrails_text.split('Brand:')
+        
+        # Extract universal guardrails
+        if len(parts) > 0:
+            universal_part = parts[0].replace('Universal:', '').strip()
+            if universal_part:
+                # Split by semicolon or newline
+                rules = [r.strip() for r in universal_part.replace('\n', ';').split(';') if r.strip()]
+                result['universal'] = rules
+        
+        # Extract brand guardrails
+        if len(parts) > 1:
+            brand_part = parts[1].strip()
+            if brand_part:
+                rules = [r.strip() for r in brand_part.replace('\n', ';').split(';') if r.strip()]
+                result['brand'] = rules
+        
+        return result
+    
+    except Exception as e:
+        logger.error(f"Error parsing guardrails: {e}")
+        return {'universal': [], 'brand': []}
+
+
+def validate_banner_guardrails(headline: str, caption: str, brand_context: dict) -> tuple:
+    """
+    Validate generated banner copy against brand guardrails.
+    
+    Checks headline and caption for potential guardrail violations using pattern matching.
+    
+    Args:
+        headline: Generated headline text
+        caption: Generated caption text
+        brand_context: Brand context dict from get_brand_context()
+    
+    Returns:
+        Tuple of (is_valid: bool, violations: List[str])
+        is_valid=True if no guardrails violated
+        violations: List of detected violations (empty if valid)
+    
+    Example:
+        >>> ctx = {
+        ...     'tone': 'Friendly, dependable',
+        ...     'guardrails': 'No academic/grade-improvement claims on stationery'
+        ... }
+        >>> headline = "Get Better Grades with Classmate Notebooks"
+        >>> caption = "Academic boost guaranteed"
+        >>> valid, violations = validate_banner_guardrails(headline, caption, ctx)
+        >>> valid
+        False
+        >>> 'academic' in str(violations).lower()
+        True
+    """
+    try:
+        violations = []
+        combined_text = f"{headline} {caption}".lower()
+        
+        if not brand_context or not brand_context.get('guardrails'):
+            logger.info("No guardrails defined for this brand")
+            return True, []
+        
+        # Parse guardrails
+        guardrails = parse_guardrails(brand_context.get('guardrails', ''))
+        all_rules = guardrails.get('universal', []) + guardrails.get('brand', [])
+        
+        # Common violation patterns
+        violation_patterns = {
+            'academic claims': ['academic', 'grades', 'score', 'marks', 'exam', 'performance improvement'],
+            'health claims': ['health', 'posture', 'orthopaedic', 'back pain', 'medical', 'cure', 'heal'],
+            'superlatives': ['best', 'greatest', 'only', 'perfect', 'ultimate', 'guaranteed', 'premium only'],
+            'unverified': ['proven', 'scientifically', 'research shows', 'studies show'],
+        }
+        
+        # Check for violation patterns
+        for pattern_name, keywords in violation_patterns.items():
+            if any(keyword in combined_text for keyword in keywords):
+                # Check if this pattern is mentioned in guardrails
+                for rule in all_rules:
+                    if pattern_name.lower() in rule.lower():
+                        violations.append(
+                            f"Potential violation: '{pattern_name}' detected. Rule: {rule}"
+                        )
+                        break
+        
+        is_valid = len(violations) == 0
+        return is_valid, violations
+    
+    except Exception as e:
+        logger.error(f"Error validating guardrails: {e}")
+        return True, [f"Validation error: {str(e)}"]
+
+
+def prepare_brand_tone_prompt(brand_context: dict) -> str:
+    """
+    Generate LLM system instructions based on brand tone and intent.
+    
+    Creates markdown-formatted instructions to be injected into LLM prompts.
+    
+    Args:
+        brand_context: Brand context dict from get_brand_context()
+    
+    Returns:
+        String with brand-specific system instructions for LLM prompt
+    
+    Example:
+        >>> ctx = {
+        ...     'name': 'Classmate',
+        ...     'tone': 'Friendly, dependable, student-first',
+        ...     'focus_intent': 'Everyday reliability for students',
+        ...     'category': 'Stationery'
+        ... }
+        >>> instructions = prepare_brand_tone_prompt(ctx)
+        >>> "Friendly, dependable" in instructions
+        True
+    """
+    try:
+        if not brand_context:
+            return ""
+        
+        brand_name = brand_context.get('name', 'Brand')
+        tone = brand_context.get('tone', '')
+        focus_intent = brand_context.get('focus_intent', '')
+        category = brand_context.get('category', '')
+        guardrails = brand_context.get('guardrails', '')
+        
+        instructions = ""
+        
+        if tone:
+            instructions += f"\n• Brand Tone: Write in a {tone} tone\n"
+        
+        if focus_intent:
+            instructions += f"• Campaign Focus: Emphasize {focus_intent}\n"
+        
+        if category:
+            instructions += f"• Product Category: {category}\n"
+        
+        if guardrails:
+            guardrails_dict = parse_guardrails(guardrails)
+            instructions += f"\n• STRICT GUARDRAILS — Do NOT violate:\n"
+            
+            for rule in guardrails_dict.get('universal', []):
+                instructions += f"  - {rule}\n"
+            
+            for rule in guardrails_dict.get('brand', []):
+                instructions += f"  - {rule}\n"
+        
+        return instructions
+    
+    except Exception as e:
+        logger.error(f"Error preparing brand tone prompt: {e}")
+        return ""
+
+
+def generate_hero_banner_prompt_for_retail_with_brand(
+    llm,
+    content: str,
+    aspect_ratio: str,
+    size_label: str,
+    intent: str,
+    brand_context: dict | None = None,
+    has_logo: bool = False
+) -> tuple:
+    """
+    Generate a retail hero banner prompt WITH BRAND GUIDELINES (NEW).
+    
+    Enhanced version of generate_hero_banner_prompt_for_retail() that integrates
+    brand tone, focus_intent, and guardrails into the LLM prompt.
+    Validates generated copy against brand guardrails.
+    
+    Args:
+        llm: Language model instance (e.g., initialize_5o_mini_llm())
+        content: Campaign content/context
+        aspect_ratio: Banner aspect ratio (e.g., "16:9", "1:1")
+        size_label: Human-readable size label (e.g., "Widescreen")
+        intent: Campaign intent from banner_options
+        brand_context: Brand context dict from get_brand_context() [NEW PARAM]
+        has_logo: Whether logo is available
+    
+    Returns:
+        Tuple of (image_prompt: str, is_valid: bool, violations: List[str])
+        - image_prompt: The generated image generation prompt for Gemini
+        - is_valid: Whether generated copy passes guardrail validation
+        - violations: List of guardrail violations (empty if valid)
+    
+    Example:
+        >>> brand_data = {'data': [{'brand_name': 'Classmate', ...}]}
+        >>> ctx = get_brand_context(brand_data, 'Classmate')
+        >>> llm = initialize_5o_mini_llm()
+        >>> prompt, valid, violations = generate_hero_banner_prompt_for_retail_with_brand(
+        ...     llm, "Back to school content", "16:9", "Widescreen", "Back to School", 
+        ...     brand_context=ctx, has_logo=True
+        ... )
+        >>> if not valid:
+        ...     print(f"Review violations: {violations}")
+    """
+    try:
+        layout_hint = LAYOUT_HINTS.get(aspect_ratio, LAYOUT_HINTS.get("16:9", "standard layout"))
+        intent_line = f"• Campaign intent: {intent}" if intent else ""
+        logo_line = "• Include a placeholder area for brand logo (top corner or subtle overlay)" if has_logo else ""
+        
+        # Build brand-aware instructions [NEW]
+        brand_instructions = ""
+        if brand_context:
+            brand_instructions = prepare_brand_tone_prompt(brand_context)
+            print(f"🏷️ Brand context loaded for: {brand_context.get('name', 'Unknown Brand')}")
+        
+        brand_name_display = brand_context.get('name', '') if brand_context else ""
+        brand_line = f"• Brand: {brand_name_display}" if brand_name_display else ""
+        
+        prompt = f"""
+You are an award-winning ecommerce creative director specialising in high-conversion retail promotional banners.
+Your task: produce ONE highly detailed image-generation prompt for a premium retail promotional banner.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CAMPAIGN CONTEXT (use fully):
+{content}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BANNER SPECS:
+• Aspect ratio : {aspect_ratio} ({size_label})
+• Layout       : {layout_hint}
+{intent_line}
+{brand_line}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BRAND-SPECIFIC GUIDELINES:
+{brand_instructions if brand_instructions else "• No specific brand guidelines provided"}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RETAIL PROMOTIONAL BANNER PRINCIPLES — follow ALL strictly:
+
+1. HEADLINE (MANDATORY)
+- One bold, attention-grabbing headline (max 8–10 words)
+- Must reflect campaign theme + product value
+- Must align with brand tone if provided
+- Placed prominently over image
+
+2. CAPTION (MANDATORY)
+- One concise supporting line reinforcing value
+- Positioned directly below headline
+
+3. BACKGROUND IMAGE (MANDATORY)
+- Full-bleed, high-quality lifestyle scene
+- Must reflect campaign context and brand identity
+
+4. QUALITY & GUARDRAILS
+- Ultra high-resolution, sharp ecommerce-quality output
+- If humans present: Natural posture, no distortions
+- All text grammatically correct and spelling error-free
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT RULES:
+
+• Return ONLY the final image-generation prompt
+• No explanations, no markdown
+• Must include: Exact headline, caption, background description, product placement, lighting, aspect ratio {aspect_ratio}
+{logo_line}
+
+Generate the hero banner prompt now.
+"""
+        
+        response = llm.invoke(prompt)
+        image_prompt = response.content.strip()
+        print(f"🎨 Hero banner prompt ({aspect_ratio} — {size_label}):\n{image_prompt[:300]}...")
+        
+        # Extract headline and caption for validation [NEW]
+        lines = image_prompt.split('\n')
+        headline = ""
+        caption = ""
+        
+        for i, line in enumerate(lines):
+            if len(line) > 10 and i < len(lines)-1:
+                headline = line.strip()
+                caption = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                break
+        
+        # Validate against guardrails [NEW]
+        is_valid = True
+        violations = []
+        if brand_context:
+            is_valid, violations = validate_banner_guardrails(
+                headline or image_prompt[:100],
+                caption or image_prompt[100:200],
+                brand_context
+            )
+            if violations:
+                print(f"⚠️  Guardrail validation: {len(violations)} warning(s)")
+                for v in violations[:3]:  # Print first 3
+                    print(f"   - {v}")
+            else:
+                print(f"✅ Banner copy passes all brand guardrails")
+        
+        return image_prompt, is_valid, violations
+    
+    except Exception as e:
+        logger.error(f"Error generating brand-aware banner prompt: {e}")
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return "", False, [str(e)]
+    
