@@ -1,18 +1,1 @@
-Traceback (most recent call last):
-  File "C:\Users\ST127673\Ai_engineering_buddy\batch_process\src\hls_platform\banner.py", line 738, in handle_banner_refine
-    image = Image.open(io.BytesIO(image_data))
-                       ~~~~~~~~~~^^^^^^^^^^^^
-TypeError: a bytes-like object is required, not 'coroutine'
-INFO:     127.0.0.1:0 - "POST /batch_process/hls_platform/banner_refine?domain=sales HTTP/1.1" 500 Internal Server Error
 
-
-Banner Regeneration Through Feedback
-Requirement:Allow users to refine and regenerate the generated banner using feedback prompts.
-Examples:
-Remove the Q1 FY27 section from the banner.
-Change the title color to blue.
-Reduce the logo size.
-Expected Behavior:
-User enters feedback on the generated output.
-Feedback is used as a refinement prompt.
-System generates and displays an updated banner.
