@@ -7,6 +7,7 @@ TypeError: a bytes-like object is required, not 'coroutine'
 INFO:     127.0.0.1:0 - "POST /batch_process/hls_platform/banner_refine?domain=sales HTTP/1.1" 500 Internal Server Error
 
 i provided sales_banner.py,SalesBannerGenerator.tsx,sales_content_factory_routes.py,BannerRefinePanel.tsx
-BannerRefinePanel.tsx is used for my sales_banner for refinement . it is actually used for hls banner so i cant modify it . create a new sales_BannerRefinePanel.tsx that only used for sales .take BannerRefinePanel.tsx as reference and create 
+in contenthistory after generated output is viewed , BannerRefinePanel.tsx is displayed and asks for Refine with AI.
+BannerRefinePanel.tsx is used for banner for refinement . it is actually used for hls banner so i cant modify the existing code . create a new function in BannerRefinePanel.tsx use it that only used for sales_banner .take BannerRefinePanel.tsx as reference and create 
 
 make this functionality work properly
