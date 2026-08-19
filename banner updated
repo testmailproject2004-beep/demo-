@@ -1,709 +1,1915 @@
-import uuid, json, os, traceback
-
-from fastapi import APIRouter, Request, Depends, HTTPException, Path, BackgroundTasks
-from fastapi.responses import JSONResponse
-from ..utils.zenseai_content_factory_utils import get_domain_param
-from sqlalchemy.ext.asyncio import AsyncSession
-from ..configurations.session import get_session
-from ..hls_platform.sales_presentation_plus import handle_sales_presentation_plus
-from ..hls_platform.sales_banner import (
-    sales_banner_generate_handler,
-    sales_banner_list_templates_handler,
-    sales_banner_template_image_handler,
-    sales_banner_upload_template_handler,
-    sales_banner_delete_template_handler,
-    sales_banner_refine_handler,
-)
-from ..hls_platform.main import hls_uploads_path
-from sqlalchemy import text, select
-from ..config import settings
-
-from common.database.models.content_factory import SalesCFeedback
-
-
-from ..hls_platform.sharepoint_workflow import (
-    sync_sharepoint_files_handler,
-    get_sharepoint_microsites_helper,
-    send_sharepoint_microsite_by_id_helper,
-    convert_sharepoint_microsite_by_id_helper
-)
-from ..hls_platform.local_documents import upload_local_document_helper
-from ..hls_platform.brands import get_image_url_helper
-from ..hls_platform.presentation_templates_api import (
-    get_templates_helper,
-    create_template_helper,
-    delete_template_helper
-)
-
-sales_content_factory_router = APIRouter(prefix="/sales_platform", tags=["Sales Platform"])
-
-
-# ---------- Sales Banner Generation Routes ----------
-@sales_content_factory_router.post("/banner/generate")
-async def sales_generate_banner(request: Request, db: AsyncSession = Depends(get_session)):
-    """
-    Generate an AI-edited sales banner from one of the approved templates.
-
-    Request payload:
-    {
-        "template_id": "template-6",
-        "title": "Q3 Sales Champion",
-        "description": "Congratulations on closing the year with record numbers",
-        "prompt": "make the confetti more subtle",
-        "aspect_ratio": "16:9",
-        "photo": "data:image/png;base64,..."   // optional — omit to keep the template's existing photo
-    }
-
-    User identity is resolved the same way sales_generate_presentation_plus
-    resolves it below — body first, JWT + a user_entity lookup as fallback
-    — and passed down as plain parameters rather than re-resolved inside
-    the handler.
-    """
-    data = await request.json()
-
-    user_id = data.get('userId') or data.get('user_id')
-    user_name = data.get('userName') or data.get('user_name', 'Unknown User')
-    print(f"[banner/generate] user_id from request body: {user_id!r}")
-
-    # fallback user_id from token
-    if not user_id or not str(user_id).isdigit() or str(user_id) in ["null", "unknown_user", "None"]:
-        auth_header = request.headers.get('Authorization')
-        print(f"[banner/generate] no usable user_id in body — Authorization header: "
-              f"{'present' if auth_header else 'MISSING'}")
-        if auth_header and auth_header.startswith('Bearer '):
-            token = auth_header.split(' ', 1)[1]
-            import jwt as pyjwt
-            sub = None
-            try:
-                jwt_secret_key = settings.jwt.secret_key
-                decoded = pyjwt.decode(token, jwt_secret_key, algorithms=["HS256"])
-                sub = decoded.get('sub')
-                print(f"[banner/generate] token decoded OK — sub={sub!r}")
-            except pyjwt.exceptions.InvalidSignatureError as e:
-                # Confirmed via direct testing: this token is well-formed,
-                # fresh, and not expired — the signing key just doesn't
-                # match settings.jwt.secret_key. That's worth fixing at
-                # the source. In the meantime: this decode is only ever
-                # used to attribute a Content History row to a user, never
-                # to gate access to anything in this handler, so reading
-                # sub without verifying the signature is safe here
-                # specifically — it is NOT a general "skip auth" pattern.
-                print(f"[banner/generate] signature check failed ({e}) — "
-                      f"falling back to unverified decode for attribution only")
-                try:
-                    unverified = pyjwt.decode(token, options={"verify_signature": False})
-                    sub = unverified.get('sub')
-                    print(f"[banner/generate] unverified decode — sub={sub!r}")
-                except Exception as e2:
-                    print("[banner/generate] Unverified decode also failed:", e2)
-            except Exception as e:
-                print("[banner/generate] Token decode failed:", e)
-
-            try:
-                if sub:
-                    q = text("SELECT id, name FROM user_entity WHERE email = :email")
-                    result = await db.execute(q, {"email": sub})
-                    r = result.mappings().first()
-                    print(f"[banner/generate] user_entity lookup for {sub!r}: "
-                          f"{'found id=' + str(r['id']) if r else 'NO MATCH'}")
-
-                    if r:
-                        user_id = str(r["id"])
-                        if user_name == "Unknown User":
-                            user_name = r["name"]
-
-            except Exception as e:
-                print("[banner/generate] user_entity lookup failed:", e)
-        else:
-            print("[banner/generate] no Bearer token present — user_id stays unresolved")
-
-    print(f"[banner/generate] final: user_id={user_id!r} user_name={user_name!r}")
-    return await sales_banner_generate_handler(request, db, user_id=user_id, user_name=user_name)
-
-
-@sales_content_factory_router.get("/banner/templates")
-async def sales_list_banner_templates():
-    """The single source of truth the picker fetches from — no more
-    frontend-bundled copy that can drift out of sync with this folder."""
-    return await sales_banner_list_templates_handler()
-
-
-@sales_content_factory_router.get("/banner/templates/{template_id}/image")
-async def sales_get_banner_template_image(template_id: str, w: int | None = None):
-    return await sales_banner_template_image_handler(template_id, width=w)
-
-
-@sales_content_factory_router.post("/banner/templates")
-async def sales_upload_banner_template(request: Request):
-    """Body: {"name": "Sales Champion", "image": "data:image/png;base64,..."}"""
-    return await sales_banner_upload_template_handler(request)
-
-
-@sales_content_factory_router.delete("/banner/templates/{template_id}")
-async def sales_delete_banner_template(template_id: str):
-    return await sales_banner_delete_template_handler(template_id)
-
-
-@sales_content_factory_router.post("/banner/refine")
-async def sales_refine_banner(request: Request, db: AsyncSession = Depends(get_session)):
-    """
-    Refine an already-generated sales banner using feedback text.
-
-    Body: {"transaction_uuid": "...", "feedback": "...", "source_version_idx": 0}
-    source_version_idx is optional (0 = original, 1 = first edit, 2 =
-    second edit, ...); omitted means "refine from the latest version".
-
-    Self-contained to sales_banner.py — a separate implementation from
-    banner.py's /hls_platform/banner_refine, not a call into it.
-    """
-    return await sales_banner_refine_handler(request, db)
-
-
-# ---------- Routes ----------
-@sales_content_factory_router.get("/get_all_microsites")
-async def sales_get_all_microsites(db: AsyncSession = Depends(get_session)):
-    return await get_sharepoint_microsites_helper(db)
-
-
-@sales_content_factory_router.post("/sharepoint/sync")
-async def sales_sharepoint_sync(db: AsyncSession = Depends(get_session)):
-    return await sync_sharepoint_files_handler(db)
-
-
-@sales_content_factory_router.post("/send_microsite_by_id")
-async def sales_send_microsite_by_id(request: Request,
-    db: AsyncSession = Depends(get_session)):
-    return await send_sharepoint_microsite_by_id_helper(request, db)
-
-
-@sales_content_factory_router.post("/sharepoint/convert")
-async def sales_convert_sharepoint_microsite(request: Request,
-    db: AsyncSession = Depends(get_session)):
-    return await convert_sharepoint_microsite_by_id_helper(request, db)
-
-
-@sales_content_factory_router.get("/image_url/{document_path:path}")
-async def sales_get_image_url(document_path: str = Path(...)):
-    return await get_image_url_helper(document_path)
-
-
-@sales_content_factory_router.post("/local_documents")
-async def sales_upload_local_document(request: Request, db: AsyncSession = Depends(get_session)):
-    domain = await get_domain_param(request)
-    return await upload_local_document_helper(domain, request, db)
-
-
-@sales_content_factory_router.get("/templates")
-async def sales_get_templates(request: Request, db: AsyncSession = Depends(get_session)):
-    domain = await get_domain_param(request)
-    return await get_templates_helper(domain, db, request)
-
-
-@sales_content_factory_router.post("/templates")
-async def sales_create_template(request: Request, db: AsyncSession = Depends(get_session)):
-    domain = await get_domain_param(request)
-    return await create_template_helper(domain, request, db)
-
-
-@sales_content_factory_router.delete("/templates/{template_id}")
-async def sales_delete_template(template_id: int, db: AsyncSession = Depends(get_session)):
-    return await delete_template_helper(template_id, db)
-
-
-@sales_content_factory_router.post("/sales/presentation/render_pptx")
-async def sales_render_sales_presentation(request: Request):
-    try:
-        from ..hls_platform.sales_presentation import render_edited_sales_presentation
-
-        data = await request.json()
-        domain = await get_domain_param(request)
-
-        return render_edited_sales_presentation(
-            data=data,
-            user_id=data.get('userId') or data.get('user_id'),
-            user_name=data.get('userName') or data.get('user_name', 'Unknown User'),
-            transaction_uuid=data.get('transaction_uuid'),
-            output_folder=data.get('output_folder'),
-            format_type=data.get('format_type'),
-            domain=domain,
-            downloaded_files=data.get('downloaded_files'),
-            input_folder=data.get('input_folder'),
-            usage_stats={
-                'prompt_tokens': data.get('input_tokens', 0),
-                'completion_tokens': data.get('output_tokens', 0),
-                'cost': data.get('total_cost', 0.0)
-            }
-        )
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@sales_content_factory_router.post("/sales/presentation/regenerate_slide")
-async def sales_regenerate_sales_slide(request: Request):
-    try:
-        from ..hls_platform.sales_presentation import regenerate_sales_slide
-
-        data = await request.json()
-        domain = await get_domain_param(request)
-
-        slide_data = data.get('slide_data')
-        custom_prompt = data.get('custom_prompt')
-        user_id = data.get('userId') or data.get('user_id')        
-        if not slide_data:
-            raise HTTPException(status_code=400, detail="Missing slide_data")
-
-        updated_slide = regenerate_sales_slide(slide_data, custom_prompt, user_id=user_id, domain=domain)
-
-        if "error" in updated_slide:
-            raise HTTPException(status_code=500, detail=updated_slide)
-
-        return JSONResponse(content=updated_slide)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-@sales_content_factory_router.post('/sales/presentation_plus/generate')
-async def sales_generate_presentation_plus(request: Request, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_session)):
-    try:
-        data = await request.json()
-        domain = request.query_params.get("domain")
-
-        user_id = data.get('userId') or data.get('user_id')
-        user_name = data.get('userName') or data.get('user_name', 'Unknown User')
-
-        # fallback user_id from token
-        if not user_id or not str(user_id).isdigit() or str(user_id) in ["null", "unknown_user", "None"]:
-            auth_header = request.headers.get('Authorization')
-            if auth_header and auth_header.startswith('Bearer '):
-                token = auth_header.split(' ', 1)[1]
-                import jwt as pyjwt
-                try:
-                    jwt_secret_key = settings.jwt.secret_key
-                    decoded = pyjwt.decode(token, jwt_secret_key, algorithms=["HS256"])
-                    sub = decoded.get('sub')
-
-                    if sub:
-                        q = text("SELECT id, name FROM user_entity WHERE email = :email")
-                        result = await db.execute(q, {"email": sub})
-                        r = result.mappings().first()
-
-                        if r:
-                            user_id = str(r["id"])
-                            if user_name == "Unknown User":
-                                user_name = r["name"]
-
-                except Exception as e:
-                    print("Token decode failed:", e)
-
-        transaction_uuid = data.get('transaction_uuid')
-        output_folder = data.get('output_folder')
-        format_type = data.get('format_type', 'presentation +')
-        downloaded_files = data.get('downloaded_files')
-        input_folder = data.get('input_folder')
-        presentation_options = data.get('presentation_options', {})
-
-        # Always create a new UUID for Presentation + to avoid clashing with normal presentation
-        transaction_uuid = str(uuid.uuid4())
-
-        uuid_path = os.path.join(hls_uploads_path, transaction_uuid)
-
-        if not input_folder:
-            input_folder = os.path.join(uuid_path, "input_folder")
-            os.makedirs(input_folder, exist_ok=True)
-
-        if not output_folder:
-            output_folder = os.path.join(uuid_path, "output_folder")
-            os.makedirs(output_folder, exist_ok=True)
-
-        veeva_file_ids = data.get('veeva_file_ids', [])
-        combined_content = data.get('combined_content', '')
-
-        if not combined_content and veeva_file_ids:
-            from ..hls_platform.connectors import connector_factory
-            from ..hls_platform.connectors.connector_factory import get_connector
-
-            connector = get_connector(connector_factory.get_connector_name_by_domain(domain))
-            downloaded_files, combined_content = await connector.download_all_files(db, veeva_file_ids, input_folder)
-
-        status_file = os.path.join(uuid_path, "status.json")
-
-        async def update_step(msg):
-            try:
-                if os.path.exists(status_file):
-                    with open(status_file, "r") as f:
-                        data = json.load(f)
-                    data["step"] = msg
-                    with open(status_file, "w") as f:
-                        json.dump(data, f)
-            except:
-                pass
-
-        async def background_task():
-            try:
-                with open(status_file, "w") as f:
-                    json.dump({
-                        "status": "processing",
-                        "transaction_uuid": transaction_uuid,
-                        "step": "Initializing... (Please wait)"
-                    }, f)
-
-                resp = await handle_sales_presentation_plus(
-                    db=db,
-                    combined_content=combined_content,
-                    format_type=format_type,
-                    output_folder=output_folder,
-                    downloaded_files=downloaded_files,
-                    domain=domain,
-                    user_id=user_id,
-                    user_name=user_name,
-                    transaction_uuid=transaction_uuid,
-                    input_folder=input_folder,
-                    presentation_options=presentation_options,
-                    status_callback=update_step
-                )
-
-                if resp.status_code == 200:
-                    res_data = json.loads(resp.body.decode("utf-8"))
-                    with open(status_file, "w") as f:
-                        json.dump({
-                            "status": "completed",
-                            "response_json": res_data,
-                            "filepath": res_data.get("filepath"),
-                            "filename": res_data.get("filename"),
-                            "inputTokens": resp.headers.get('X-Input-Tokens', 0),
-                            "outputTokens": resp.headers.get('X-Output-Tokens', 0),
-                            "totalCost": resp.headers.get('X-Total-Cost', 0)
-                        }, f)
-                else:
-                    with open(status_file, "w") as f:
-                        json.dump({
-                            "status": "error",
-                            "message": "Failed to generate Presentation+"
-                        }, f)
-
-            except Exception as e:
-                traceback.print_exc()
-                with open(status_file, "w") as f:
-                    json.dump({
-                        "status": "error",
-                        "message": str(e)
-                    }, f)
-
-        # run background
-        background_tasks.add_task(background_task)
-
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "processing",
-                "transaction_uuid": transaction_uuid
-            }
-        )
-
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))    
-
-
-@sales_content_factory_router.post('/content_feedback')
-async def sales_submit_content_feedback(request: Request, db: AsyncSession = Depends(get_session)):
-    """Store user star-rating and/or text feedback for a Sales CF generated content item.
-    Both fields are optional; if the user skips, both will be stored as NULL.
-    """
-    try:
-        data = await request.json() or {}
-        domain = request.query_params.get("domain")
-        
-        transaction_uuid = data.get("transaction_uuid")
-        result = await db.execute(
-            select(SalesCFeedback).where(
-                SalesCFeedback.transaction_uuid == transaction_uuid
-            )
-        )
-        existing = result.scalars().first()
-
-
-        if existing:
-            if data.get('star_rating') is not None:
-                existing.star_rating = data.get('star_rating')
-            if data.get('feedback_text') is not None:
-                existing.feedback_text = data.get('feedback_text')
-            feedback_id = existing.id
-        else:
-            feedback = SalesCFeedback(
-                transaction_uuid=transaction_uuid,
-                format_type=data.get('format_type'),
-                domain=data.get('domain', 'sales'),
-                star_rating=data.get('star_rating'),
-                feedback_text=data.get('feedback_text'),
-                user_id=str(data.get('user_id')) if data.get('user_id') else None,
-                user_name=data.get('user_name'),
-            )
-
-            db.add(feedback)
-            await db.flush()  # To get auto-generated id
-
-            feedback_id = feedback.id
-            
-        await db.commit()
-
-        return JSONResponse(content={"status": "success", "id": feedback_id}, status_code=200)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@sales_content_factory_router.get('/sales-feedback/{transaction_uuid}')
-async def sales_get_content_feedback(
-    transaction_uuid: str,
-    db: AsyncSession = Depends(get_session)
-):
-
-    try:
-        result = await db.execute(
-            select(SalesCFeedback)
-            .where(SalesCFeedback.transaction_uuid == transaction_uuid)
-            .order_by(SalesCFeedback.created_at.asc())
-        )
-
-        records = result.scalars().all()
-
-
-        if not records:
-            raise HTTPException(status_code=404, detail="No feedback found")
-
-        merged_star = None
-        merged_text = None
-        latest_id = None
-        latest_format = None
-        latest_created_at = None
-
-        for record in records:
-            if record.star_rating is not None:
-                merged_star = record.star_rating
-            if record.feedback_text is not None:
-                merged_text = record.feedback_text
-            latest_id = record.id
-            latest_format = record.format_type
-            latest_created_at = record.created_at
-
-        return {
-            "id": latest_id,
-            "transaction_uuid": transaction_uuid,
-            "format_type": latest_format,
-            "star_rating": merged_star,
-            "feedback_text": merged_text,
-            "created_at": latest_created_at.isoformat() if latest_created_at else None,
-        }
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))        
-
-
-
-
-
-
-
-
-
-// Modeled on BannerRefinePanel.tsx (used for HLS banners, unmodified) —
-// same UI/UX and prop contract, so it drops in as a straight swap wherever
-// a sales-domain banner needs refining, but talks to a completely
-// separate backend endpoint:
-//
-//   BannerRefinePanel.tsx  -> POST /batch_process/hls_platform/banner_refine
-//   SalesBannerRefinePanel -> POST /batch_process/sales_platform/banner/refine
-//
-// The two are independent implementations end to end (this file's backend
-// counterpart is sales_banner.py's sales_banner_refine_handler, which does
-// not import from or depend on banner.py in any way) — not a wrapper
-// around the existing component.
-
-import { useState } from 'react';
-import { Sparkles, Loader2 } from 'lucide-react';
-import { middleware_url } from '../../../utils/constants';
-
-export interface SalesBannerVersion {
-  version: number;
+INFO:     127.0.0.1:0 - "POST /batch_process/sales_platform/banner/refine HTTP/1.1" 404 Not Found
+C:\Users\ST127673\Ai_engineering_buddy\engg-buddy-ui-facelift\src\hls_src\components\ConvertContent\SalesBannerRefinePanel.tsx
+import { useState, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { Button } from '../ui/button';
+import { Badge } from '../ui/badge';
+import {
+  Download,
+  Eye,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  Clock,
+  Trash2,
+  User,
+  Mic,
+  Video,
+  Map,
+  FileText,
+  HelpCircle,
+  Volume2,
+  Share2,
+  Zap,
+  BookOpen,
+  ScrollText,
+  Send,
+  X,
+  RefreshCw,
+  Filter,
+  Check,
+  BarChart3,
+  Mail,
+  Upload,
+  History,
+  Pencil,
+} from 'lucide-react';
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from '../ui/dropdown-menu';
+import { Separator } from '../ui/separator';
+import { Textarea } from '../ui/textarea';
+import { Card } from '../ui/card';
+import { flask_url, middleware_url } from '../../../utils/constants';
+import { getAllBrands, Brand } from '../../services/brandsApi';
+import { RefineWithAI } from './RefineWithAI';
+import { MicroDramaRefineWithAI } from './MicroDramaRefineWithAI';
+import { ContentFeedback, MiniStarRating, InlineTextFeedback, isFeedbackFormat } from './ContentFeedback';
+import { PodcastPreview } from './PodcastPreview';
+import { VideoPreview } from './VideoPreview';
+import { BlogPreview } from './BlogPreview';
+import { MindMapPreview } from './MindMapPreview';
+import { QuizPreview } from './QuizPreview';
+import { pushToVeeva, VeevaPushResult } from '../../services/veevaPushApi';
+import { CorporateCommunicationPreview } from './CorporateCommunicationPreview';
+import { HeroBannerPreview } from './HeroBannerPreview';
+import { BannerRefinePanel, BannerVersion } from './BannerRefinePanel';
+import { SalesBannerRefinePanel, SalesBannerVersion } from './SalesBannerRefinePanel';
+import { EmailPreview } from './EmailPreview';
+import { HtmlEmailPreview } from './HtmlEmailPreview';
+import { LinkedInPreview } from './LinkedInPreview';
+import { FacebookPreview } from './FacebookPreview';
+import QuizModal from './QuizModal';
+import MindElixir from 'mind-elixir';
+import {
+  generateQuizPDF,
+  generateEmailPDF,
+  generateSocialMediaPDF,
+  generateMarkdownPDF,
+} from '../../utils/pdfGenerator';
+import { getDomain } from '../../context/DomainContext';
+
+const historyPromptCategories = [
+  {
+    category: 'Tone & Style',
+    prompts: [
+      'Make it more professional',
+      'Make it more casual',
+      'Add more technical depth',
+      'Simplify for general audience',
+    ]
+  },
+  {
+    category: 'Length',
+    prompts: [
+      'Make it more concise',
+      'Expand with more details',
+      'Add examples',
+      'Remove redundancy',
+    ]
+  },
+  {
+    category: 'Content Enhancement',
+    prompts: [
+      'Add key takeaways',
+      'Improve clarity',
+      'Enhance readability',
+      'Add action items',
+    ]
+  },
+];
+
+export interface HistoryItem {
+  id: string;
+  uuid: string;
+  timestamp: Date;
+  sourceFiles: string[];
+  format: string;
+  status: 'completed' | 'failed' | 'pending';
+  outputFilename: string;
+  outputFilePath: string;
+  editedFilePaths: string[];
+  createdBy: string;
+  createdPerson: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalCost?: number;
+}
+
+interface ApiTransaction {
+  id: string;
+  uuid: string;
+  format_type: string;
+  input_file_paths: string[];
+  output_file_path: string;
+  edited_file_paths: string[];
+  created_by: string;
+  created_person: string;
+  created_at: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_cost?: number;
+}
+
+interface VideoVersion {
   label: string;
-  url: string;
-  blob: Blob;
+  filePath: string;
+  blobUrl: string | null;
 }
 
-interface SalesBannerRefinePanelProps {
-  transactionUuid: string | null;
-  versions: SalesBannerVersion[];
-  activeVersionIdx: number;
-  onNewVersion: (version: SalesBannerVersion) => void;
-  onSelectVersion: (idx: number) => void;
-  className?: string;
+interface ContentVersion {
+  label: string;
+  filePath: string;
+  content: any; // null means not yet loaded
 }
 
-export function SalesBannerRefinePanel({
-  transactionUuid,
-  versions,
-  activeVersionIdx,
-  onNewVersion,
-  onSelectVersion,
-  className = '',
-}: SalesBannerRefinePanelProps) {
-  const [feedback, setFeedback] = useState('');
-  const [isRefining, setIsRefining] = useState(false);
-  const [error, setError] = useState('');
+// Helper function to expand all nodes in mindmap
+const expandAllNodes = (nodeData: any) => {
+  if (!nodeData) return;
+  nodeData.expanded = true;
+  if (nodeData.children && nodeData.children.length > 0) {
+    nodeData.children.forEach((child: any) => {
+      expandAllNodes(child);
+    });
+  }
+};
 
-  const handleRefine = async () => {
-    if (!feedback.trim()) return;
-    if (!transactionUuid) {
-      setError('No transaction found. Generate a banner first.');
-      return;
-    }
-
-    setIsRefining(true);
-    setError('');
-
+// Helper function to export mindmap to SVG
+const exportMindmapToSvg = async (mindmapData: any, filename: string): Promise<void> => {
+  return new Promise((resolve, reject) => {
     try {
-      const token = localStorage.getItem('token');
-      const response = await fetch(`${middleware_url}/batch_process/sales_platform/banner/refine`, {
+      // Create temporary container for MindElixir
+      const tempDiv = document.createElement('div');
+      tempDiv.style.position = 'fixed';
+      tempDiv.style.left = '-9999px';
+      tempDiv.style.top = '-9999px';
+      tempDiv.style.width = '1200px';
+      tempDiv.style.height = '800px';
+      document.body.appendChild(tempDiv);
+
+      // Initialize MindElixir
+      const mind = new MindElixir({
+        el: tempDiv,
+        direction: MindElixir.SIDE,
+        draggable: false,
+        contextMenu: false,
+        toolBar: false,
+        keypress: false,
+      });
+
+      // Prepare data - handle both direct nodeData and wrapped formats
+      let dataToLoad;
+      if (mindmapData.nodeData) {
+        dataToLoad = mindmapData;
+      } else if (mindmapData.id && mindmapData.topic) {
+        dataToLoad = { nodeData: mindmapData };
+      } else {
+        throw new Error('Invalid mindmap data format');
+      }
+
+      // Expand all nodes
+      if (dataToLoad.nodeData) {
+        expandAllNodes(dataToLoad.nodeData);
+      }
+
+      // Initialize with data
+      mind.init(dataToLoad);
+
+      // Wait for rendering and export
+      setTimeout(() => {
+        try {
+          const styles = `
+            .mind-elixir {
+              --main-bgcolor: #f7f8fb;
+              --color: #1f2937;
+              --root-bgcolor: #d9d6ff;
+              --node-bgcolor: #eeecff;
+              --line-color: #c4c7e6;
+              --node-border-radius: 16px;
+              --node-padding-x: 18px;
+              --node-padding-y: 10px;
+            }
+            .mind-elixir .node {
+              box-shadow: 0 10px 24px rgba(60, 64, 130, 0.15);
+            }
+          `;
+          
+          const blob = mind.exportSvg(false, styles);
+          if (!blob) {
+            throw new Error('Failed to generate SVG blob');
+          }
+
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          a.click();
+          URL.revokeObjectURL(url);
+
+          // Cleanup
+          document.body.removeChild(tempDiv);
+          resolve();
+        } catch (err) {
+          document.body.removeChild(tempDiv);
+          reject(err);
+        }
+      }, 500);
+    } catch (err) {
+      reject(err);
+    }
+  });
+};
+
+const formatTokens = (tokens: number): string => {
+  if (tokens >= 1000) {
+    return (tokens / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+  }
+  return tokens.toString();
+};
+
+
+export const ContentHistory = forwardRef((props, ref) => {
+  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+  const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [viewingItem, setViewingItem] = useState<HistoryItem | null>(null);
+  const [viewingFileContent, setViewingFileContent] = useState<string | any>(null);
+  const [viewingLoading, setViewingLoading] = useState(false);
+  const [editedVideoUrl, setEditedVideoUrl] = useState<string | null>(null);
+  const [videoVersions, setVideoVersions] = useState<VideoVersion[]>([]);
+  const [activeVersionIdx, setActiveVersionIdx] = useState(0);
+  const [contentVersions, setContentVersions] = useState<ContentVersion[]>([]);
+  const [activeContentVersionIdx, setActiveContentVersionIdx] = useState(0);
+  const [showQuizModal, setShowQuizModal] = useState(false);
+  const [quizData, setQuizData] = useState<any>(null);
+  const [selectedFormats, setSelectedFormats] = useState<string[]>([]);
+  const [selectedCreatedPersons, setSelectedCreatedPersons] = useState<string[]>([]);
+  const [selectedFileNames, setSelectedFileNames] = useState<string[]>([]);
+  const [brands, setBrands] = useState<Brand[]>([]);
+  const [hlsEmailHistoryPreviewType, setHlsEmailHistoryPreviewType] = useState<'email' | 'mlr'>('email'); // Track which preview to show for HLS emails in history
+  const [isPushing, setIsPushing] = useState(false);
+  const [pushSuccess, setPushSuccess] = useState(false);
+  const domain = getDomain();
+
+  // Track per-item quick feedback (star + text) that the user submits from the card directly
+  const [itemFeedback, setItemFeedback] = useState<Record<string, { rating: number | null; text: string | null }>>({});
+
+  const fetchContentHistory = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      // Fetch data from the API endpoint
+      const response = await fetch(`${middleware_url}/batch_process/hls_platform/content_history?domain=${domain}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${localStorage.getItem("token")}`
         },
-        body: JSON.stringify({
-          transaction_uuid: transactionUuid,
-          feedback: feedback.trim(),
-          source_version_idx: activeVersionIdx,
-        }),
+        credentials: 'include', // Include cookies for authentication
       });
 
       if (!response.ok) {
-        const err = await response.json().catch(() => ({ error: 'Unknown error' }));
-        throw new Error(err.error || err.detail || `HTTP ${response.status}`);
+        throw new Error(`Failed to fetch content history: ${response.statusText}`);
       }
 
-      const versionNum = parseInt(response.headers.get('X-Version-Number') || '2', 10);
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
+      const apiResponse = await response.json();
 
-      onNewVersion({
-        version: versionNum,
-        label: `v${versionNum}`,
-        url,
-        blob,
-      });
+      if (apiResponse.status === 'success' && apiResponse.data) {
+        // Transform API data to HistoryItem format
+        const transformedData: HistoryItem[] = apiResponse.data.map(
+          (transaction: ApiTransaction) => {
+            const inputPaths = transaction.input_file_paths && transaction.input_file_paths.length > 0
+              ? transaction.input_file_paths
+              : [];
+            const outputPath = transaction.output_file_path || '';
+            
+            // Append 'Z' to explicitly mark as UTC (backend sends datetime without timezone)
+            const utcTimestamp = transaction.created_at.includes('Z') 
+              ? transaction.created_at 
+              : transaction.created_at + 'Z';
 
-      setFeedback('');
-    } catch (e: any) {
-      setError(e.message || 'Refinement failed');
+            return {
+              id: transaction.id.toString(),
+              uuid: transaction.uuid,
+              timestamp: new Date(utcTimestamp),
+              sourceFiles: inputPaths.map(path => extractFileName(path)),
+              format: transaction.format_type || 'Unknown',
+              status: 'completed' as const,
+              outputFilename: extractFileName(outputPath),
+              outputFilePath: outputPath,
+              editedFilePaths: transaction.edited_file_paths || [],
+              createdBy: transaction.created_by,
+              createdPerson: transaction.created_person,
+              inputTokens: transaction.input_tokens,
+              outputTokens: transaction.output_tokens,
+              totalCost: transaction.total_cost,
+              feedback: (transaction as any).feedback
+            };
+          }
+        );
+
+        // Populate initial feedback state to avoid extra API calls
+        const initialFeedback: Record<string, { rating: number | null; text: string | null }> = {};
+        apiResponse.data.forEach((item: any) => {
+          if (item.uuid && item.feedback) {
+            initialFeedback[item.uuid] = {
+              rating: item.feedback.star_rating ?? null,
+              text: item.feedback.feedback_text ?? null
+            };
+          }
+        });
+        setItemFeedback(prev => ({ ...prev, ...initialFeedback }));
+
+        // Sort by timestamp (newest first)
+        transformedData.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+        setHistoryItems(transformedData);
+      } else {
+        throw new Error('Invalid response format');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An error occurred while fetching data');
+      console.error('Error fetching content history:', err);
     } finally {
-      setIsRefining(false);
+      setLoading(false);
     }
   };
 
-  return (
-    <div className={`flex flex-col h-full ${className}`}>
-      {/* Header */}
-      <div className="px-4 py-3 border-b border-[#b3e0ff] flex-shrink-0">
-        <div className="flex items-center gap-2">
-          <Sparkles className="size-4 text-[#005AC3]" />
-          <span className="text-slate-800 font-semibold text-sm">Refine with AI</span>
-        </div>
-        <p className="text-slate-400 text-xs mt-0.5">Describe what to change and regenerate</p>
-      </div>
+  useEffect(() => {
+    // Fetch history only on component mount
+    if (historyItems.length === 0) {
+      fetchContentHistory();
+    }
+  }, []);
 
-      {/* Prompt area */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-4">
-        <div className="flex flex-col gap-2">
-          <textarea
-            value={feedback}
-            onChange={(e) => setFeedback(e.target.value)}
-            placeholder="e.g. Remove the Q1 FY27 section, change the title color to blue, reduce the logo size..."
-            rows={5}
-            className="w-full rounded-md border border-[#b3e0ff] bg-white text-slate-700 text-sm px-3 py-2 resize-none focus:outline-none focus:ring-2 focus:ring-[#53A2FF]/40 placeholder:text-slate-400"
-            disabled={isRefining}
+  useEffect(() => {
+    getAllBrands(domain).then(setBrands).catch(() => {});
+  }, []);
+
+  const getBrandLogoUrl = (brandName: string): string => {
+    if (!brandName) return '';
+    const lowerName = brandName.toLowerCase();
+    const brand = brands.find(b => b.brand_name?.toLowerCase() === lowerName);
+    if (brand?.brand_logo) return `${middleware_url}/batch_process/hls_platform/brand_logo/${brand.brand_logo}`;
+    return '';
+  };
+
+  // Expose refresh function to parent component
+  useImperativeHandle(ref, () => ({
+    refreshHistory: fetchContentHistory
+  }));
+
+  const extractFileName = (filePath: string): string => {
+    if (!filePath) return 'Unknown';
+    // Handle both Windows (\\) and Unix (/) path separators, including double slashes
+    const normalized = filePath.replace(/\\/g, '/');
+    const parts = normalized.split('/').filter(part => part.length > 0);
+    return parts[parts.length - 1] || 'Unknown';
+  };
+
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'completed':
+        return <CheckCircle2 className="size-3.5 text-green-600" />;
+      case 'failed':
+        return <AlertCircle className="size-3.5 text-red-600" />;
+      case 'pending':
+        return <Loader2 className="size-3.5 text-yellow-600 animate-spin" />;
+      default:
+        return null;
+    }
+  };
+
+  const formatTypeName = (format: string): string => {
+    if (!format) return 'Unknown';
+    // Convert snake_case or kebab-case to Title Case
+    return format
+      .replace(/[_-]/g, ' ')
+      .split(' ')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ');
+  };
+  const formatFileName = (filename: string): string => {
+    if (!filename) return 'Unknown';
+    // Remove file extension
+    const nameWithoutExt = filename.replace(/\.[^.]*$/, '');
+    // Replace underscores and hyphens with spaces
+    const withSpaces = nameWithoutExt.replace(/[_-]/g, ' ');
+    // Capitalize first letter of each word
+    return withSpaces
+      .split(' ')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ');
+  };
+  const getFormatIcon = (format: string) => {
+    const formatLower = format.toLowerCase().replace(/[\s_-]/g, '');
+    const iconConfig: Record<string, JSX.Element> = {
+      'podcast': <Mic className="size-3.5 text-purple-600" />,
+      'video': <Video className="size-3.5 text-blue-600" />,
+      'videoformat': <Video className="size-3.5 text-blue-600" />,
+      'moviemaker': <Video className="size-3.5 text-red-600" />,
+      'microdrama': <Video className="size-3.5 text-violet-600" />,
+      'mindmap': <Map className="size-3.5 text-green-600" />,
+      'blog': <FileText className="size-3.5 text-blue-600" />,
+      'bloguserstory': <FileText className="size-3.5 text-blue-700" />,
+      'story': <BookOpen className="size-3.5 text-indigo-600" />,
+      'usecase': <Share2 className="size-3.5 text-teal-600" />,
+      'techpaper': <ScrollText className="size-3.5 text-sky-600" />,
+      'whitepaper': <FileText className="size-3.5 text-slate-600" />,
+      'casestudy': <FileText className="size-3.5 text-cyan-600" />,
+      'quiz': <HelpCircle className="size-3.5 text-orange-600" />,
+      'audiosummary': <Volume2 className="size-3.5 text-indigo-600" />,
+      'documentgeneration': <Zap className="size-3.5 text-cyan-600" />,
+      'codeanalysis': <Zap className="size-3.5 text-amber-600" />,
+      'deployment': <Zap className="size-3.5 text-lime-600" />,
+      'corporatecommunication': <BarChart3 className="size-3.5 text-blue-600" />,
+      'email': <Mail className="size-3.5 text-sky-600" />,
+      'socialmedia': <Share2 className="size-3.5 text-blue-700" />,
+      'banner': <BarChart3 className="size-3.5 text-red-500" />,
+    };
+    return iconConfig[formatLower] || <FileText className="size-3.5 text-gray-600" />;
+  };
+
+  const handleView = async (item: HistoryItem) => {
+    try {
+      if (!item.outputFilePath) {
+        alert('No output file path available');
+        return;
+      }
+
+      // Presentations are binary — open modal with icon, no need to fetch file
+      const formatLowerCheck = item.format.toLowerCase().replace(/[\s_-]/g, '');
+      if (formatLowerCheck === 'presentation') {
+        setViewingItem(item);
+        setViewingFileContent(item.outputFilePath || item.outputFilename || 'presentation.pptx');
+        return;
+      }
+
+      setViewingLoading(true);
+      setViewingItem(item);
+
+      // Send request to backend with file_path in payload
+      const response = await fetch(`${middleware_url}/batch_process/hls_platform/view_file`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem("token")}`
+        },
+        body: JSON.stringify({
+          file_path: item.outputFilePath,
+        }),
+        credentials: 'include',
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to load file: ${response.statusText}`);
+      }
+
+      // Determine content type based on format and file extension
+      const contentType = response.headers.get('content-type') || '';
+      const fileExtension = item.outputFilePath.split('.').pop()?.toLowerCase() || '';
+      const formatLower = item.format.toLowerCase().replace(/[\s_-]/g, '');
+
+      // Determine if this should be text content
+      const isTextFormat = ['blog', 'bloguserstory', 'story', 'usecase', 'techpaper', 'whitepaper', 'casestudy', 'mindmap', 'quiz', 'email', 'socialmedia'].includes(formatLower);
+      const isAudioVideo = ['podcast', 'video', 'videoformat', 'audiosummary', 'microdrama', 'moviemaker'].includes(formatLower);
+      const isTextExtension = ['md', 'json', 'txt', 'html'].includes(fileExtension);
+      const isImageExtension = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(fileExtension);
+
+      let data;
+
+      if (contentType.includes('application/zip') || contentType.includes('application/x-zip')) {
+        // ZIP content (HLS email with MLR)
+        const blob = await response.blob();
+        const JSZip = (await import('jszip')).default;
+        const zip = await JSZip.loadAsync(blob);
+        
+        const files: { name: string; content: string }[] = [];
+        
+        for (const fileName of Object.keys(zip.files)) {
+          const file = zip.files[fileName];
+          if (!file.dir) {
+            const content = await file.async('text');
+            files.push({ name: fileName, content });
+          }
+        }
+        
+        data = {
+          isZip: true,
+          files,
+          blob
+        };
+      }
+      else if (contentType.includes('application/json') || (isTextFormat && fileExtension === 'json')) {
+        // JSON content
+        data = await response.json();
+      } else if (contentType.includes('text') || (isTextFormat && isTextExtension)) {
+        // Text content (markdown, plain text, etc.)
+        data = await response.text();
+      } else if (isAudioVideo || (contentType.includes('audio') || contentType.includes('video'))) {
+        // Audio/Video: create blob URL
+        const blob = await response.blob();
+        data = window.URL.createObjectURL(blob);
+      } else if (isImageExtension || contentType.includes('image')) {
+        // Image: create blob URL for images
+        const blob = await response.blob();
+        data = window.URL.createObjectURL(blob);
+      } else {
+        // Default: try text first, fallback to blob URL
+        try {
+          data = await response.text();
+          // If it looks like a valid JSON or markdown, keep it as text
+          if (data.startsWith('{') || data.startsWith('[') || data.includes('#')) {
+            // Already set to data
+          }
+        } catch {
+          // If text parsing fails, create blob URL
+          const blob = await response.blob();
+          data = window.URL.createObjectURL(blob);
+        }
+      }
+
+      setViewingFileContent(data);
+
+      // For microdrama / banner: initialise version tabs (Original + any existing edits from DB)
+      const fmtCheck = item.format.toLowerCase().replace(/[\s_-]/g, '');
+      if (fmtCheck === 'microdrama' || fmtCheck === 'banner') {
+        const versions: VideoVersion[] = [
+          { label: 'Original', filePath: item.outputFilePath, blobUrl: data },
+          ...item.editedFilePaths.map((fp, i) => ({
+            label: `v${i + 2}`,
+            filePath: fp,
+            blobUrl: null,
+          })),
+        ];
+        setVideoVersions(versions);
+        setActiveVersionIdx(0);
+      } else if (item.editedFilePaths.length > 0) {
+        // For all other formats with edited versions: set up content version tabs
+        setContentVersions([
+          { label: 'Original', filePath: item.outputFilePath, content: data },
+          ...item.editedFilePaths.map((fp, i) => ({
+            label: `Edit ${i + 1}`,
+            filePath: fp,
+            content: null,
+          })),
+        ]);
+        setActiveContentVersionIdx(0);
+      } else {
+        setContentVersions([]);
+        setActiveContentVersionIdx(0);
+      }
+    } catch (err) {
+      console.error('Error loading file for preview:', err);
+      alert(`Failed to load preview: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      setViewingItem(null);
+      setViewingFileContent(null);
+      setHlsEmailHistoryPreviewType('email');
+    } finally {
+      setViewingLoading(false);
+    }
+  };
+
+  const renderPreview = () => {
+    if (!viewingItem || viewingFileContent === null) return null;
+
+    const formatLower = viewingItem.format.toLowerCase().replace(/[\s_-]/g, '');
+
+    switch (formatLower) {
+      case 'podcast':
+        return (
+          <PodcastPreview
+            content={{ fileUrl: viewingFileContent, blob: null }}
+            podcastFileUrl={viewingFileContent}
           />
-          {error && <p className="text-red-500 text-xs">{error}</p>}
-          <button
-            onClick={handleRefine}
-            disabled={isRefining || !feedback.trim() || !transactionUuid}
-            className="w-full flex items-center justify-center gap-2 py-2 rounded-md text-sm font-medium bg-[#53A2FF] hover:bg-[#3d8beb] text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {isRefining ? (
-              <>
-                <Loader2 className="size-4 animate-spin" />
-                Regenerating...
-              </>
-            ) : (
-              <>
-                <Sparkles className="size-4" />
-                Regenerate Banner
-              </>
-            )}
-          </button>
-        </div>
-
-        {/* Versions */}
-        {versions.length > 0 && (
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <p className="text-slate-500 text-xs font-medium uppercase tracking-wide">Versions</p>
-              <span className="text-[10px] text-slate-400 bg-slate-100 rounded-full px-2 py-0.5 font-medium">
-                {versions.length} total
-              </span>
-            </div>
-            {/* Pill tab strip */}
-            <div className="flex gap-1.5 overflow-x-auto pb-1 scrollbar-hide">
-              {versions.map((v, idx) => {
-                const isActive = activeVersionIdx === idx;
-                const isLatest = idx === versions.length - 1 && versions.length > 1;
-                return (
+        );
+      case 'video':
+      case 'videoformat':
+      case 'moviemaker':
+        return (
+          <VideoPreview
+            content={{ fileUrl: viewingFileContent, blob: null }}
+            videoFileUrl={viewingFileContent}
+            videoFileName={viewingItem.outputFilename}
+          />
+        );
+      case 'microdrama': {
+        const activeUrl = videoVersions[activeVersionIdx]?.blobUrl ?? viewingFileContent;
+        return (
+          <div className="flex flex-col h-full">
+            {/* Version tabs */}
+            {videoVersions.length > 1 && (
+              <div className="flex items-center gap-1 px-4 pt-3 pb-0 border-b border-gray-100 flex-shrink-0">
+                {videoVersions.map((v, i) => (
                   <button
-                    key={v.version}
-                    onClick={() => onSelectVersion(idx)}
-                    className={`relative flex-shrink-0 flex flex-col items-center gap-0.5 px-3 pt-2 pb-1.5 rounded-xl border transition-all duration-150 min-w-[56px] ${
-                      isActive
-                        ? 'border-[#53A2FF] bg-[#53A2FF] text-white shadow-md shadow-[#53A2FF]/30'
-                        : 'border-[#d1e9ff] bg-white text-slate-500 hover:border-[#53A2FF]/50 hover:bg-[#f0f8ff]'
+                    key={i}
+                    onClick={() => handleVersionSelect(i)}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-t-md border-b-2 transition-colors flex items-center gap-1 ${
+                      activeVersionIdx === i
+                        ? 'border-[#53A2FF] text-[#53A2FF] bg-blue-50'
+                        : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50'
                     }`}
                   >
-                    {isLatest && (
-                      <span className={`absolute -top-1.5 -right-1 text-[9px] font-bold px-1 rounded-full leading-tight ${
-                        isActive ? 'bg-white text-[#53A2FF]' : 'bg-[#53A2FF] text-white'
-                      }`}>
-                        NEW
-                      </span>
+                    {v.label}
+                    {activeVersionIdx === i && !v.blobUrl && (
+                      <Loader2 className="size-3 animate-spin" />
                     )}
-                    <span className="text-sm font-bold leading-none">{v.label}</span>
-                    <span className={`text-[9px] font-medium leading-none ${isActive ? 'text-white/80' : 'text-slate-400'}`}>
-                      {idx === 0 ? 'Original' : `Rev ${idx}`}
-                    </span>
                   </button>
-                );
-              })}
+                ))}
+              </div>
+            )}
+            {/* Active video */}
+            <div className="flex-1 overflow-hidden">
+              {activeUrl ? (
+                <VideoPreview
+                  content={{ fileUrl: activeUrl, blob: null }}
+                  videoFileUrl={activeUrl}
+                  videoFileName={videoVersions[activeVersionIdx]?.label === 'Original'
+                    ? viewingItem.outputFilename
+                    : `${viewingItem.outputFilename.replace('.mp4', '')}_${videoVersions[activeVersionIdx]?.label.toLowerCase().replace(' ', '_')}.mp4`
+                  }
+                />
+              ) : (
+                <div className="flex items-center justify-center h-full">
+                  <Loader2 className="size-8 text-[#53A2FF] animate-spin" />
+                </div>
+              )}
             </div>
-            {/* Active version label */}
-            <p className="text-[11px] text-slate-400 text-center">
-              Viewing: <span className="text-[#005AC3] font-medium">
-                {activeVersionIdx === 0 ? 'Original generation' : `Revision ${activeVersionIdx}`}
-              </span>
-            </p>
           </div>
-        )}
+        );
+      }
+      case 'blog':
+        return (
+          <BlogPreview
+            content={{
+              title: formatTypeName(viewingItem.format),
+              author: viewingItem.createdPerson,
+              date: viewingItem.timestamp.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+              readTime: '5-7 min',
+              category: 'Healthcare'
+            }}
+            previewContent={typeof viewingFileContent === 'string' ? viewingFileContent : JSON.stringify(viewingFileContent)}
+          />
+        );
+      case 'bloguserstory':
+        return (
+          <BlogPreview
+            content={{
+              title: 'Blog User Story',
+              author: viewingItem.createdPerson,
+              date: viewingItem.timestamp.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+              readTime: '5-7 min',
+              category: 'User Story'
+            }}
+            previewContent={typeof viewingFileContent === 'string' ? viewingFileContent : JSON.stringify(viewingFileContent)}
+          />
+        );
+      case 'story':
+        return (
+          <BlogPreview
+            content={{
+              title: 'Patient Story',
+              author: viewingItem.createdPerson,
+              date: viewingItem.timestamp.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+              readTime: '5-7 min',
+              category: 'Story'
+            }}
+            previewContent={typeof viewingFileContent === 'string' ? viewingFileContent : JSON.stringify(viewingFileContent)}
+          />
+        );
+      case 'usecase':
+        return (
+          <BlogPreview
+            content={{
+              title: 'Use Case',
+              author: viewingItem.createdPerson,
+              date: viewingItem.timestamp.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+              readTime: '6-8 min',
+              category: 'Use Case'
+            }}
+            previewContent={typeof viewingFileContent === 'string' ? viewingFileContent : JSON.stringify(viewingFileContent)}
+          />
+        );
+      case 'techpaper':
+        return (
+          <BlogPreview
+            content={{
+              title: 'Technology Paper',
+              author: viewingItem.createdPerson,
+              date: viewingItem.timestamp.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+              readTime: '8-10 min',
+              category: 'Technology'
+            }}
+            previewContent={typeof viewingFileContent === 'string' ? viewingFileContent : JSON.stringify(viewingFileContent)}
+          />
+        );
+      case 'whitepaper':
+        return (
+          <BlogPreview
+            content={{
+              title: 'Whitepaper',
+              author: viewingItem.createdPerson,
+              date: viewingItem.timestamp.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+              readTime: '10-15 min',
+              category: 'Whitepaper'
+            }}
+            previewContent={typeof viewingFileContent === 'string' ? viewingFileContent : JSON.stringify(viewingFileContent)}
+          />
+        );
+      case 'casestudy':
+        return (
+          <BlogPreview
+            content={{
+              title: 'Case Study',
+              author: viewingItem.createdPerson,
+              date: viewingItem.timestamp.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+              readTime: '8-12 min',
+              category: 'Case Study'
+            }}
+            previewContent={typeof viewingFileContent === 'string' ? viewingFileContent : JSON.stringify(viewingFileContent)}
+          />
+        );
+      case 'mindmap':
+        return (
+          <MindMapPreview
+            data={typeof viewingFileContent === 'string' ? JSON.parse(viewingFileContent) : viewingFileContent}
+            isLoading={false}
+          />
+        );
+      case 'quiz':
+        const parsedQuizData = typeof viewingFileContent === 'string' ? JSON.parse(viewingFileContent) : viewingFileContent;
+        return (
+          <QuizPreview
+            previewContent={{ quiz: { data: parsedQuizData } }}
+            onStartQuiz={() => {
+              setQuizData(parsedQuizData);
+              setShowQuizModal(true);
+            }}
+          />
+        );
+      case 'audiosummary':
+        return (
+          <PodcastPreview
+            content={{ fileUrl: viewingFileContent, blob: null }}
+            podcastFileUrl={viewingFileContent}
+          />
+        );
+      case 'corporatecommunication':
+        if (viewingFileContent?.isZip && viewingFileContent.files?.length >= 2 && domain.toLowerCase() === 'hls') {
+          const emailFile = viewingFileContent.files.find((f: any) => !f.name.startsWith('mlr_'));
+          const mlrFile = viewingFileContent.files.find((f: any) => f.name.startsWith('mlr_'));
+          
+          if (emailFile && mlrFile) {
+            return (
+              <>
+                <div className="flex justify-center gap-2 mb-4 mt-4">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div onClick={() => setHlsEmailHistoryPreviewType('email')} className={`cursor-pointer transition-all rounded-md overflow-hidden px-3 py-1.5 flex items-center justify-center text-sm font-medium ${hlsEmailHistoryPreviewType === 'email'? 'bg-[#53A2FF] hover:bg-[#3d8beb] text-white shadow-md' : 'bg-white hover:bg-gray-50 border border-[#b3e0ff] text-slate-700'}`}>Preview</div>
+                    <div onClick={() => setHlsEmailHistoryPreviewType('mlr')} className={`cursor-pointer transition-all rounded-md overflow-hidden px-3 py-1.5 flex items-center justify-center text-sm font-medium ${hlsEmailHistoryPreviewType === 'mlr' ? 'bg-[#53A2FF] hover:bg-[#3d8beb] text-white shadow-md' : 'bg-white hover:bg-gray-50 border border-[#b3e0ff] text-slate-700'}`}>MLR Pre-Check Dossier</div>
+                  </div>
+                </div>
+                <HtmlEmailPreview 
+                  html={hlsEmailHistoryPreviewType === 'email' ? emailFile.content : mlrFile.content} 
+                />
+              </>
+            );
+          }
+        }
+        return (
+          <CorporateCommunicationPreview
+            content={{ fileUrl: viewingFileContent, blob: null }}
+            corporateCommunicationFileUrl={viewingFileContent}
+          />
+        );
+      case 'srl':
+        if (typeof viewingFileContent === 'string' && viewingFileContent.trim().startsWith('<')) {
+          return <HtmlEmailPreview html={viewingFileContent} />;
+        }
+        if (viewingFileContent?.isZip && viewingFileContent.files?.length >= 2 && domain.toLowerCase() === 'hls') {
+          const emailFile = viewingFileContent.files.find((f: any) => !f.name.startsWith('mlr_'));
+          const mlrFile = viewingFileContent.files.find((f: any) => f.name.startsWith('mlr_'));
 
-        {!transactionUuid && (
-          <p className="text-slate-400 text-xs text-center mt-4">
-            Generate a banner first to enable refinement
-          </p>
-        )}
+          // return (
+          //       <HtmlEmailPreview 
+          //         html={emailFile.content} 
+          //       />
+          // )
+          
+          if (emailFile && mlrFile) {
+            return (
+              <>
+                <div className="flex justify-center gap-2 mb-4 mt-4">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div onClick={() => setHlsEmailHistoryPreviewType('email')} className={`cursor-pointer transition-all rounded-md overflow-hidden px-3 py-1.5 flex items-center justify-center text-sm font-medium ${hlsEmailHistoryPreviewType === 'email'? 'bg-[#53A2FF] hover:bg-[#3d8beb] text-white shadow-md' : 'bg-white hover:bg-gray-50 border border-[#b3e0ff] text-slate-700'}`}>Preview</div>
+                    <div onClick={() => setHlsEmailHistoryPreviewType('mlr')} className={`cursor-pointer transition-all rounded-md overflow-hidden px-3 py-1.5 flex items-center justify-center text-sm font-medium ${hlsEmailHistoryPreviewType === 'mlr' ? 'bg-[#53A2FF] hover:bg-[#3d8beb] text-white shadow-md' : 'bg-white hover:bg-gray-50 border border-[#b3e0ff] text-slate-700'}`}>MLR Pre-Check Dossier</div>
+                  </div>
+                </div>
+                <HtmlEmailPreview 
+                  html={hlsEmailHistoryPreviewType === 'email' ? emailFile.content : mlrFile.content} 
+                />
+              </>
+            );
+          }
+        }
+        return (
+          <></>
+        );
+      case 'banner': {
+        const activeBannerUrl = videoVersions[activeVersionIdx]?.blobUrl ?? viewingFileContent;
+        return (
+          <HeroBannerPreview
+            content={{ fileUrl: activeBannerUrl, blob: null }}
+          />
+        );
+      }
+
+      
+      case 'infographic':
+        console.log('viewingFileContent =', viewingFileContent);
+
+        return (
+          <div className="w-full h-full flex items-center justify-center bg-white p-4">
+            {viewingFileContent
+              ? (
+                <img
+                  src={viewingFileContent}
+                  alt="Infographic"
+                  className="max-w-full max-h-full object-contain"
+                />
+              ) : null}
+          </div>
+        );
+
+      case 'email': {
+        // Check if content is ZIP (HLS domain with email + MLR)
+        if (viewingFileContent?.isZip && viewingFileContent.files?.length >= 2 && domain.toLowerCase() === 'hls') {
+          const emailFile = viewingFileContent.files.find((f: any) => f.name.startsWith('email_'));
+          const mlrFile = viewingFileContent.files.find((f: any) => f.name.startsWith('mlr_'));
+          
+          if (emailFile && mlrFile) {
+            return (
+              <>
+                <div className="flex justify-center gap-2 mb-4 mt-4">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div onClick={() => setHlsEmailHistoryPreviewType('email')} className={`cursor-pointer transition-all rounded-md overflow-hidden px-3 py-1.5 flex items-center justify-center text-sm font-medium ${hlsEmailHistoryPreviewType === 'email'? 'bg-[#53A2FF] hover:bg-[#3d8beb] text-white shadow-md' : 'bg-white hover:bg-gray-50 border border-[#b3e0ff] text-slate-700'}`}>Email Preview</div>
+                    <div onClick={() => setHlsEmailHistoryPreviewType('mlr')} className={`cursor-pointer transition-all rounded-md overflow-hidden px-3 py-1.5 flex items-center justify-center text-sm font-medium ${hlsEmailHistoryPreviewType === 'mlr' ? 'bg-[#53A2FF] hover:bg-[#3d8beb] text-white shadow-md' : 'bg-white hover:bg-gray-50 border border-[#b3e0ff] text-slate-700'}`}>MLR Pre-Check Dossier</div>
+                  </div>
+                </div>
+                <HtmlEmailPreview 
+                  html={hlsEmailHistoryPreviewType === 'email' ? emailFile.content : mlrFile.content} 
+                />
+              </>
+            );
+          }
+        }
+        
+        // Check if content is HTML (non-HLS domain or single file)
+        if (typeof viewingFileContent === 'string' && viewingFileContent.trim().startsWith('<')) {
+          return <HtmlEmailPreview html={viewingFileContent} />;
+        }
+        
+        // JSON email data
+        const emailData = typeof viewingFileContent === 'string'
+          ? JSON.parse(viewingFileContent)
+          : viewingFileContent;
+        return <EmailPreview data={emailData} />;
+      }
+      case 'socialmedia': {
+        const postData = typeof viewingFileContent === 'string'
+          ? JSON.parse(viewingFileContent)
+          : viewingFileContent;
+
+        const platform = postData?.post_metadata?.platform?.toLowerCase() || 'linkedin';
+        const brandLogoUrl = getBrandLogoUrl(postData?.post_metadata?.brand || '');
+
+        if (platform === 'facebook') {
+          return <FacebookPreview data={postData} brandLogoUrl={brandLogoUrl} domain={domain} />;
+        } else {
+          return <LinkedInPreview data={postData} brandLogoUrl={brandLogoUrl} domain={domain} />;
+        }
+      }
+      case 'presentation':
+        return (
+          <div className="flex flex-col items-center justify-center h-full py-20">
+            <div
+              onClick={() => viewingItem && handleDownload(viewingItem)}
+              className="flex flex-col items-center gap-5 cursor-pointer group select-none"
+              title="Click to download"
+            >
+              {/* PPTX File Icon */}
+              <div className="relative w-24 h-28 group-hover:scale-105 transition-transform duration-150">
+                <div className="absolute inset-0 bg-white rounded-lg border border-gray-200 shadow-lg" />
+                <div
+                  className="absolute top-0 right-0 w-7 h-7 bg-gray-100 border-l border-b border-gray-200 rounded-bl-sm"
+                  style={{ borderRadius: '0 6px 0 0', background: 'linear-gradient(225deg, #e5e7eb 50%, #f9fafb 50%)' }}
+                />
+                <div className="absolute bottom-0 left-0 right-0 h-10 bg-red-600 rounded-b-lg flex items-center justify-center gap-1">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="white">
+                    <path d="M9 12h6M9 16h4M7 4H4a1 1 0 00-1 1v14a1 1 0 001 1h16a1 1 0 001-1V8l-5-4H7z" stroke="white" strokeWidth="2" fill="none" strokeLinecap="round"/>
+                  </svg>
+                  <span className="text-white font-bold text-xs tracking-widest">PPTX</span>
+                </div>
+                <div className="absolute top-4 left-0 right-0 flex items-center justify-center">
+                  <span className="text-red-600 font-bold text-3xl" style={{ fontFamily: 'Calibri, sans-serif' }}>P</span>
+                </div>
+              </div>
+              <p className="text-gray-800 font-semibold text-sm max-w-xs text-center break-all px-4 leading-snug">
+                {viewingItem.outputFilename || 'presentation.pptx'}
+              </p>
+              <div className="flex items-center gap-2 text-gray-400 text-xs">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
+                </svg>
+                <span className="group-hover:text-red-500 transition-colors">Click to download</span>
+              </div>
+            </div>
+          </div>
+        );
+      default:
+        return (
+          <div className="w-full h-full flex items-center justify-center bg-slate-50">
+            <div className="text-center">
+              <FileText className="size-12 text-slate-400 mx-auto mb-2" />
+              <p className="text-slate-600 text-sm">File: {viewingItem.outputFilename}</p>
+            </div>
+          </div>
+        );
+    }
+  };
+
+  const closePreview = () => {
+    if (typeof viewingFileContent === 'string' && viewingFileContent.startsWith('blob:')) {
+      window.URL.revokeObjectURL(viewingFileContent);
+    }
+    // Revoke any edit blob URLs we created
+    videoVersions.forEach((v, i) => {
+      if (i > 0 && v.blobUrl && v.blobUrl.startsWith('blob:')) {
+        window.URL.revokeObjectURL(v.blobUrl);
+      }
+    });
+    // Revoke any blob URLs stored in contentVersions
+    contentVersions.forEach((v, i) => {
+      if (i > 0 && typeof v.content === 'string' && v.content.startsWith('blob:')) {
+        window.URL.revokeObjectURL(v.content);
+      }
+    });
+    setViewingItem(null);
+    setViewingFileContent(null);
+    setHlsEmailHistoryPreviewType('email');
+    setEditedVideoUrl(null);
+    setVideoVersions([]);
+    setActiveVersionIdx(0);
+    setContentVersions([]);
+    setActiveContentVersionIdx(0);
+    setShowQuizModal(false);
+    setQuizData(null);
+  };
+
+  const handleVersionSelect = async (idx: number) => {
+    setActiveVersionIdx(idx);
+    if (videoVersions[idx]?.blobUrl) return; // already loaded
+
+    const fp = videoVersions[idx]?.filePath;
+    if (!fp) return;
+
+    try {
+      const response = await fetch(`${middleware_url}/batch_process/hls_platform/view_file`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`,
+        },
+        credentials: 'include',
+        body: JSON.stringify({ file_path: fp }),
+      });
+      if (!response.ok) throw new Error(response.statusText);
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      setVideoVersions(prev => prev.map((v, i) => i === idx ? { ...v, blobUrl: url } : v));
+    } catch (err) {
+      console.error('Failed to load version:', err);
+    }
+  };
+
+  const handleContentVersionSelect = async (idx: number) => {
+    setActiveContentVersionIdx(idx);
+    const version = contentVersions[idx];
+    if (!version) return;
+
+    // Already loaded — just switch the displayed content
+    if (version.content !== null) {
+      setViewingFileContent(version.content);
+      return;
+    }
+
+    const fp = version.filePath;
+    if (!fp || !viewingItem) return;
+
+    try {
+      setViewingLoading(true);
+      const response = await fetch(`${middleware_url}/batch_process/hls_platform/view_file`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('token')}`,
+        },
+        credentials: 'include',
+        body: JSON.stringify({ file_path: fp }),
+      });
+      if (!response.ok) throw new Error(response.statusText);
+
+      const contentType = response.headers.get('content-type') || '';
+      const fileExtension = fp.split('.').pop()?.toLowerCase() || '';
+      const formatLower = viewingItem.format.toLowerCase().replace(/[\s_-]/g, '');
+      const isTextFormat = ['blog', 'bloguserstory', 'story', 'usecase', 'techpaper', 'whitepaper', 'casestudy', 'mindmap', 'quiz', 'email', 'socialmedia'].includes(formatLower);
+      const isAudioVideo = ['podcast', 'video', 'videoformat', 'audiosummary', 'microdrama', 'moviemaker'].includes(formatLower);
+      const isTextExtension = ['md', 'json', 'txt', 'html'].includes(fileExtension);
+
+      let content: any;
+      if (contentType.includes('application/json') || (isTextFormat && fileExtension === 'json')) {
+        content = await response.json();
+      } else if (contentType.includes('text') || (isTextFormat && isTextExtension)) {
+        content = await response.text();
+      } else {
+        const blob = await response.blob();
+        content = window.URL.createObjectURL(blob);
+      }
+
+      setContentVersions(prev => prev.map((v, i) => i === idx ? { ...v, content } : v));
+      setViewingFileContent(content);
+    } catch (err) {
+      console.error('Failed to load version content:', err);
+    } finally {
+      setViewingLoading(false);
+    }
+  };
+
+  const handleDownload = async (item: HistoryItem) => {
+    try {
+      if (!item.outputFilePath) {
+        alert('No output file path available');
+        return;
+      }
+
+      const formatLower = item.format.toLowerCase().replace(/[\s_-]/g, '');
+
+      // Send request to backend with file_path in payload
+      const response = await fetch(`${middleware_url}/batch_process/hls_platform/view_file`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem("token")}`
+        },
+        body: JSON.stringify({
+          file_path: item.outputFilePath,
+        }),
+        credentials: 'include',
+      });
+
+      // Get the content type from response
+      const contentType = response.headers.get('content-type') || '';
+
+      // For formats that need PDF conversion
+      if (['quiz', 'email', 'socialmedia', 'blog', 'story', 'usecase', 'technologypaper', 'techpaper', 'whitepaper', 'casestudy', 'srl'].includes(formatLower)) {
+        // Generate filename (remove backend extension, add .pdf)
+        const baseFilename = item.outputFilename.replace(/\.(json|md|txt)$/i, '');
+        const pdfFilename = `${baseFilename}.pdf`;
+
+        if (formatLower === 'quiz') {
+          // Get content as JSON for quiz
+          const content = await response.json();
+          generateQuizPDF(content, pdfFilename);
+        } else if (formatLower === 'email') {
+          // Check if content is ZIP (HLS domain with MLR document)
+          if (contentType.includes('application/zip')) {
+            const blob = await response.blob();
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            const zipFilename = `${baseFilename}.zip`;
+            link.download = zipFilename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+          } else {
+            // Get content as text or JSON
+            let content;
+            if (contentType.includes('application/json')) {
+              content = await response.json();
+            } else {
+              content = await response.text();
+            }
+
+            // Check if content is HTML (from HLS domain)
+            if (typeof content === 'string' && content.trim().startsWith('<')) {
+              const htmlFilename = `${baseFilename}.html`;
+              const blob = new Blob([content], { type: 'text/html' });
+              const link = document.createElement('a');
+              link.href = URL.createObjectURL(blob);
+              link.download = htmlFilename;
+              document.body.appendChild(link);
+              link.click();
+              document.body.removeChild(link);
+            }
+            // Fallback to PDF for JSON email content
+            else {
+              generateEmailPDF(content, pdfFilename);
+            }
+          }
+        } else if (formatLower === 'socialmedia') {
+          if (contentType.includes('application/zip')) {
+            const blob = await response.blob();
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            const zipFilename = `${baseFilename}.zip`;
+            link.download = zipFilename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+          } else {
+            const content = await response.json();
+            const platform = content.platform || content.post_metadata?.platform || 'Social Media';
+            generateSocialMediaPDF(content, platform, pdfFilename);
+          }
+        } else if (formatLower === 'srl') {
+          if (contentType.includes('application/zip')) {
+            const blob = await response.blob();
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            const zipFilename = `${baseFilename}.zip`;
+            link.download = zipFilename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+          } 
+        } else if (['blog', 'story', 'usecase', 'technologypaper', 'techpaper', 'whitepaper', 'casestudy'].includes(formatLower)) {
+        } else if (['blog', 'story', 'usecase', 'technologypaper', 'techpaper', 'whitepaper', 'casestudy'].includes(formatLower)) {
+          let content;
+          if (contentType.includes('application/json')) {
+            content = await response.json();
+          } else {
+            content = await response.text();
+          }
+          const title = item.format.split(/[\s_-]/).map((word: string) => 
+            word.charAt(0).toUpperCase() + word.slice(1)
+          ).join(' ');
+          generateMarkdownPDF(content, title, pdfFilename);
+        }
+      } else if (formatLower === 'mindmap') {
+        // Handle mindmap - export as SVG
+        let mindmapData;
+        if (contentType.includes('application/json')) {
+          mindmapData = await response.json();
+        } else {
+          const text = await response.text();
+          mindmapData = JSON.parse(text);
+        }
+
+        const svgFilename = item.outputFilename.replace(/\.json$/i, '.svg') || 'mindmap.svg';
+        await exportMindmapToSvg(mindmapData, svgFilename);
+      }
+      else if (formatLower === 'corporatecommunication') {
+        const baseFilename = item.outputFilename.replace(/\.(json|md|txt)$/i, '');
+        const pdfFilename = `${baseFilename}.pdf`;
+
+        if (contentType.includes('application/zip') && domain === 'hls') {
+          const blob = await response.blob();
+          const link = document.createElement('a');
+          link.href = URL.createObjectURL(blob);
+          const zipFilename = `${baseFilename}.zip`;
+          link.download = zipFilename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        }
+        else {
+          const blob = await response.blob();
+          const url = window.URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = item.outputFilename || 'download';
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          window.URL.revokeObjectURL(url);
+        }
+      
+      } else {
+        // For other formats (podcast, video, corporate communication), download as-is
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = item.outputFilename || 'download';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+      }
+    } catch (err) {
+      console.error('Error downloading file:', err);
+      alert(`Download failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  };
+
+  const handlePushToVeeva = async () => {
+    if (!viewingItem) return;
+    setIsPushing(true);
+    setPushSuccess(false);
+    try {
+      console.log("Viewing item: ", viewingItem)
+      const uuid = viewingItem.uuid;  // Use the history item's UUID as transactionUuid
+
+      // Derive brandName (similar to ContentPersonalizationEngine.tsx)
+      let brandName = 'Verveen';  // Fallback
+      // If you have format-specific options in history, use them; otherwise, use brands list
+      if (brands.length > 0) {
+        brandName = brands[0].brand_name || 'Verveen';  // Default to first brand
+      }
+
+      // Get documentId: This is tricky since HistoryItem doesn't have it.
+      // Option 1: If backend adds it, use viewingItem.documentId
+      // Option 2: Infer from sourceFiles (e.g., parse filename for ID)
+      // For now, use a placeholder or skip if unavailable
+      const documentId = (viewingItem as any).documentId || 1514;  // Fallback to default, or handle error
+
+      const result: VeevaPushResult = await pushToVeeva(uuid, brandName, documentId, domain);
+
+      if (result.success) {
+        setPushSuccess(true);
+        setTimeout(() => {
+          setPushSuccess(false);
+          closePreview();  // Optionally close modal on success
+        }, 2000);
+      } else {
+        alert(`Push failed: ${result.error}`);
+      }
+    } catch (error) {
+      console.error('Push to Veeva error:', error);
+      alert('An error occurred while pushing to Veeva.');
+    } finally {
+      setIsPushing(false);
+    }
+  };
+
+  const getFormatColor = (format: string) => {
+    const formatLower = format.toLowerCase().replace(/[\s_-]/g, '');
+    const formatColors: Record<string, string> = {
+      'podcast': 'bg-purple-50 text-purple-700 border-purple-200',
+      'video': 'bg-blue-50 text-blue-700 border-blue-200',
+      'mindmap': 'bg-green-50 text-green-700 border-green-200',
+      'blog': 'bg-blue-50 text-blue-700 border-blue-200',
+      'bloguserstory': 'bg-blue-100 text-blue-800 border-blue-300',
+      'story': 'bg-indigo-50 text-indigo-700 border-indigo-200',
+      'usecase': 'bg-teal-50 text-teal-700 border-teal-200',
+      'techpaper': 'bg-sky-50 text-sky-700 border-sky-200',
+      'whitepaper': 'bg-slate-50 text-slate-700 border-slate-200',
+      'casestudy': 'bg-cyan-50 text-cyan-700 border-cyan-200',
+      'quiz': 'bg-orange-50 text-orange-700 border-orange-200',
+      'audiosummary': 'bg-indigo-50 text-indigo-700 border-indigo-200',
+      'documentgeneration': 'bg-cyan-50 text-cyan-700 border-cyan-200',
+      'codeanalysis': 'bg-amber-50 text-amber-700 border-amber-200',
+      'deployment': 'bg-lime-50 text-lime-700 border-lime-200',
+      'corporatecommunication': 'bg-blue-50 text-blue-700 border-blue-200',
+      'email': 'bg-sky-50 text-sky-700 border-sky-200',
+      'microdrama': 'bg-violet-50 text-violet-700 border-violet-200',
+      'banner': 'bg-red-50 text-red-700 border-red-200',
+    };
+    return formatColors[formatLower] || 'bg-gray-50 text-gray-700 border-gray-200';
+  };
+
+  const getUniqueFormats = (): string[] => {
+    const uniqueFormats = Array.from(new Set(historyItems.map(item => item.format)));
+    return uniqueFormats.sort();
+  };
+
+  const getUniqueCreatedPersons = (): string[] => {
+    const uniquePersons = Array.from(new Set(historyItems.map(item => item.createdPerson).filter(Boolean)));
+    return uniquePersons.sort();
+  };
+
+  const getUniqueFileNames = (): string[] => {
+    const allFileNames = historyItems.flatMap(item => item.sourceFiles);
+    const uniqueFileNames = Array.from(new Set(allFileNames));
+    return uniqueFileNames.sort();
+  };
+
+  const toggleFormatFilter = (format: string) => {
+    setSelectedFormats(prev =>
+      prev.includes(format)
+        ? prev.filter(f => f !== format)
+        : [...prev, format]
+    );
+  };
+
+  const toggleCreatedPersonFilter = (person: string) => {
+    setSelectedCreatedPersons(prev =>
+      prev.includes(person)
+        ? prev.filter(p => p !== person)
+        : [...prev, person]
+    );
+  };
+
+  const toggleFileNameFilter = (fileName: string) => {
+    setSelectedFileNames(prev =>
+      prev.includes(fileName)
+        ? prev.filter(f => f !== fileName)
+        : [...prev, fileName]
+    );
+  };
+
+  const getFilteredHistoryItems = (): HistoryItem[] => {
+    let filtered = historyItems;
+
+    if (selectedFormats.length > 0) {
+      filtered = filtered.filter(item => selectedFormats.includes(item.format));
+    }
+
+    if (selectedCreatedPersons.length > 0) {
+      filtered = filtered.filter(item => selectedCreatedPersons.includes(item.createdPerson));
+    }
+
+    if (selectedFileNames.length > 0) {
+      filtered = filtered.filter(item => 
+        item.sourceFiles.some(file => selectedFileNames.includes(file))
+      );
+    }
+
+    return filtered;
+  };
+
+  return (
+    <div className="flex flex-col h-full overflow-hidden">
+      <div className="flex flex-col h-full overflow-hidden px-6 opacity-95">
+
+
+
+
+        <div className="mb-4 flex-shrink-0">
+          <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center gap-2">
+              <div className="bg-[#53A2FF] text-white size-7 rounded-full flex items-center justify-center text-sm font-medium shadow-sm">3</div>
+              <b className="text-slate-800 text-2xl">Content History</b>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={fetchContentHistory}
+                disabled={loading}
+                className="text-[#53A2FF] hover:bg-[#e6f5ff] p-1.5"
+                title="Refresh history"
+              >
+                <RefreshCw className={`size-4 ${loading ? 'animate-spin' : ''}`} />
+              </Button>
+              {/* Format Filter Dropdown */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className={`text-[#53A2FF] hover:bg-[#e6f5ff] p-1.5 ${selectedFormats.length > 0 ? 'bg-[#e6f5ff]' : ''}`}
+                    title="Filter by format"
+                  >
+                    <Filter className="size-4" />
+                    {selectedFormats.length > 0 && <span className="ml-1 text-xs font-semibold text-[#53A2FF]">({selectedFormats.length})</span>}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-56 bg-white border-[#b3e0ff]">
+                  <DropdownMenuLabel className="text-xs font-semibold text-slate-700">Filter by Format</DropdownMenuLabel>
+                  <DropdownMenuSeparator className="bg-[#b3e0ff]" />
+                  <div className="max-h-64 overflow-y-auto">
+                    {getUniqueFormats().map(format => (
+                      <DropdownMenuItem
+                        key={format}
+                        onSelect={() => toggleFormatFilter(format)}
+                        className="text-xs text-slate-700 cursor-pointer hover:bg-[#f0f8ff] focus:bg-[#f0f8ff] flex items-center gap-2 px-2 py-1.5"
+                      >
+                        <div className="flex items-center gap-1.5 flex-1">
+                          {getFormatIcon(format)}
+                          <span>{formatTypeName(format)}</span>
+                        </div>
+                        {selectedFormats.includes(format) && (
+                          <Check className="size-4 text-[#53A2FF] flex-shrink-0" />
+                        )}
+                      </DropdownMenuItem>
+                    ))}
+                  </div>
+                  {selectedFormats.length > 0 && (
+                    <>
+                      <DropdownMenuSeparator className="bg-[#b3e0ff]" />
+                      <DropdownMenuItem
+                        onSelect={() => setSelectedFormats([])}
+                        className="text-xs text-[#53A2FF] cursor-pointer hover:bg-[#e6f5ff] focus:bg-[#e6f5ff] py-1.5"
+                      >
+                        Clear All
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {/* Created Person Filter Dropdown */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className={`text-[#53A2FF] hover:bg-[#e6f5ff] p-1.5 ${selectedCreatedPersons.length > 0 ? 'bg-[#e6f5ff]' : ''}`}
+                    title="Filter by created person"
+                  >
+                    <User className="size-4" />
+                    {selectedCreatedPersons.length > 0 && <span className="ml-1 text-xs font-semibold text-[#53A2FF]">({selectedCreatedPersons.length})</span>}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-56 bg-white border-[#b3e0ff]">
+                  <DropdownMenuLabel className="text-xs font-semibold text-slate-700">Filter by Creator</DropdownMenuLabel>
+                  <DropdownMenuSeparator className="bg-[#b3e0ff]" />
+                  <div className="max-h-64 overflow-y-auto">
+                    {getUniqueCreatedPersons().map(person => (
+                      <DropdownMenuItem
+                        key={person}
+                        onSelect={() => toggleCreatedPersonFilter(person)}
+                        className="text-xs text-slate-700 cursor-pointer hover:bg-[#f0f8ff] focus:bg-[#f0f8ff] flex items-center gap-2 px-2 py-1.5"
+                      >
+                        <div className="flex items-center gap-1.5 flex-1">
+                          <User className="size-3 text-slate-400" />
+                          <span>{person}</span>
+                        </div>
+                        {selectedCreatedPersons.includes(person) && (
+                          <Check className="size-4 text-[#53A2FF] flex-shrink-0" />
+                        )}
+                      </DropdownMenuItem>
+                    ))}
+                  </div>
+                  {selectedCreatedPersons.length > 0 && (
+                    <>
+                      <DropdownMenuSeparator className="bg-[#b3e0ff]" />
+                      <DropdownMenuItem
+                        onSelect={() => setSelectedCreatedPersons([])}
+                        className="text-xs text-[#53A2FF] cursor-pointer hover:bg-[#e6f5ff] focus:bg-[#e6f5ff] py-1.5"
+                      >
+                        Clear All
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {/* File Name Filter Dropdown */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className={`text-[#53A2FF] hover:bg-[#e6f5ff] p-1.5 ${selectedFileNames.length > 0 ? 'bg-[#e6f5ff]' : ''}`}
+                    title="Filter by file name"
+                  >
+                    <FileText className="size-4" />
+                    {selectedFileNames.length > 0 && <span className="ml-1 text-xs font-semibold text-[#53A2FF]">({selectedFileNames.length})</span>}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-72 bg-white border-[#b3e0ff]">
+                  <DropdownMenuLabel className="text-xs font-semibold text-slate-700">Filter by File Name</DropdownMenuLabel>
+                  <DropdownMenuSeparator className="bg-[#b3e0ff]" />
+                  <div className="max-h-64 overflow-y-auto">
+                    {getUniqueFileNames().map(fileName => (
+                      <DropdownMenuItem
+                        key={fileName}
+                        onSelect={() => toggleFileNameFilter(fileName)}
+                        className="text-xs text-slate-700 cursor-pointer hover:bg-[#f0f8ff] focus:bg-[#f0f8ff] flex items-center gap-2 px-2 py-1.5"
+                      >
+                        <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                          <FileText className="size-3 text-slate-400 flex-shrink-0" />
+                          <span className="truncate" title={fileName}>{fileName}</span>
+                        </div>
+                        {selectedFileNames.includes(fileName) && (
+                          <Check className="size-4 text-[#53A2FF] flex-shrink-0" />
+                        )}
+                      </DropdownMenuItem>
+                    ))}
+                  </div>
+                  {selectedFileNames.length > 0 && (
+                    <>
+                      <DropdownMenuSeparator className="bg-[#b3e0ff]" />
+                      <DropdownMenuItem
+                        onSelect={() => setSelectedFileNames([])}
+                        className="text-xs text-[#53A2FF] cursor-pointer hover:bg-[#e6f5ff] focus:bg-[#e6f5ff] py-1.5"
+                      >
+                        Clear All
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+            </div>
+          </div>
+          <div className="flex items-center justify-between">
+            <p className="text-slate-600 text-xs">Recent generations</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-xs h-7 text-[#53A2FF] border-[#b3e0ff] hover:bg-[#e6f5ff]"
+            >
+              View History
+            </Button>
+          </div>
+        </div>
+
+
+        <div className="flex-1 overflow-y-auto min-h-0 scrollbar scrollbar-thumb-slate-300 scrollbar-track-slate-100">
+          <div className="space-y-2">
+            {loading ? (
+              <div className="flex flex-col items-center justify-center py-8 gap-3">
+                <svg className="animate-spin size-10 text-[#53A2FF]" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3"></circle>
+                  <path className="opacity-80" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
+                </svg>
+                <p className="text-sm text-slate-500">Loading history...</p>
+              </div>
+            ) : error ? (
+              <div className="flex flex-col items-center justify-center py-8 text-red-500">
+                <AlertCircle className="size-8 mb-2" />
+                <p className="text-xs text-center">{error}</p>
+              </div>
+            ) : historyItems.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-8 text-slate-400">
+                <Clock className="size-8 mb-2 opacity-50" />
+                <p className="text-xs text-center">No history yet</p>
+              </div>
+            ) : getFilteredHistoryItems().length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-8 text-slate-400">
+                <Clock className="size-8 mb-2 opacity-50" />
+                <p className="text-xs text-center">No items match selected filters</p>
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {getFilteredHistoryItems().map((item) => (
+                  <div
+                    key={item.id}
+                    onClick={() => setSelectedItemId(item.id)}
+                    className={`p-2.5 rounded-lg border-1 cursor-pointer transition-all duration-200 ${selectedItemId === item.id
+                      ? 'bg-[#e6f5ff] border-1 border-[#53A2FF] shadow-sm'
+                      : 'bg-white border-1 border-[#b3e0ff] hover:bg-[#f0f8ff]'
+                      }`}
+                  >
+                    <div className="flex items-start justify-between gap-2 mb-1.5">
+                      <div className="flex-1 min-w-0">
+                        <div className="space-y-0.5">
+                          {item.sourceFiles.map((file, idx) => (
+                            <p key={idx} className="text-xs text-slate-700 truncate pl-2 border-l-2 border-blue-300 font-medium leading-tight">
+                              {file}
+                            </p>
+                          ))}
+                        </div>
+                        {/* Quick star rating and text feedback for Sales CF formats */}
+                        {domain === 'sales' && isFeedbackFormat(item.format) && (
+                          <div className="mt-1.5 pl-2 flex items-center gap-3">
+                            <MiniStarRating
+                              transactionUuid={item.uuid}
+                              formatType={item.format}
+                              domain={domain}
+                              externalRating={itemFeedback[item.uuid]?.rating ?? null}
+                            />
+                            <InlineTextFeedback
+                              transactionUuid={item.uuid}
+                              formatType={item.format}
+                              domain={domain}
+                              externalText={itemFeedback[item.uuid]?.text ?? null}
+                              onSaved={(text) => setItemFeedback(prev => ({ ...prev, [item.uuid]: { ...prev[item.uuid], text } }))}
+                            />
+                          </div>
+                        )}
+                      </div>
+                      <Badge
+                        variant="outline"
+                        className="flex-shrink-0 flex items-center gap-1 bg-green-100 text-green-800 border-green-300 h-5"
+                      >
+                        {getStatusIcon(item.status)}
+                      </Badge>
+                    </div>
+
+                    <div className="flex items-center gap-2 flex-wrap mb-1.5">
+                      <Badge
+                        variant="outline"
+                        className={`text-xs py-1 px-2 font-medium flex items-center gap-1.5 whitespace-nowrap ${getFormatColor(item.format)}`}
+                      >
+                        {getFormatIcon(item.format)}
+                        <span>{formatTypeName(item.format)}</span>
+                      </Badge>
+                      {item.editedFilePaths.length > 0 && (
+                        <Badge
+                          variant="outline"
+                          className="text-xs py-1 px-2 font-medium flex items-center gap-1 bg-violet-50 text-violet-700 border-violet-200 whitespace-nowrap"
+                        >
+                          <Zap className="size-3" />
+                          {item.editedFilePaths.length + 1} versions
+                        </Badge>
+                      )}
+                      {item.totalCost !== undefined && (
+                        <>
+                          <Badge
+                            variant="outline"
+                            className="text-xs py-1 px-2 font-medium flex items-center gap-1 bg-slate-50 text-slate-600 border-slate-200 whitespace-nowrap"
+                          >
+                            {formatTokens((Number(item.inputTokens) || 0) + (Number(item.outputTokens) || 0))} tokens
+                          </Badge>
+                          <Badge
+                            variant="outline"
+                            className="text-xs py-1 px-2 font-medium flex items-center gap-1 bg-emerald-50 text-emerald-700 border-emerald-200 whitespace-nowrap"
+                          >
+                            ${Number(item.totalCost).toFixed(4)} cost
+                          </Badge>
+                        </>
+                      )}
+                      <div className="flex flex-col items-end ml-auto">
+                        <span className="text-xs text-slate-500 font-medium tracking-wide flex items-center gap-1">
+                          <Clock className="size-3 text-slate-400" />
+                          {item.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                        <span className="text-[10px] text-slate-400 font-medium tracking-wide mt-0.5">
+                          {item.timestamp.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' }).replace(/ /g, '-')}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="text-xs text-slate-600 mb-1.5 flex items-center gap-1.5">
+                      <User className="size-3 text-slate-400 flex-shrink-0" />
+                      <span className="font-medium text-slate-700 truncate">{item.createdPerson}</span>
+                    </div>
+
+                    {selectedItemId === item.id && (
+                      <>
+                        <Separator className="mb-1.5 bg-[#b3e0ff]" />
+                        <div className="flex gap-1 items-center">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 px-2 text-xs text-[#53A2FF] hover:bg-[#e6f5ff]"
+                            disabled={item.status !== 'completed'}
+                            onClick={() => handleView(item)}
+                          >
+                            <Eye className="size-3 mr-0.5" />
+                            View
+                          </Button>
+                          {item.format.toLowerCase().replace(/[\s_-]/g, '') === 'moviemaker' && (props as any).onEditStoryboard && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-6 px-2 text-xs text-[#53A2FF] hover:bg-[#e6f5ff]"
+                              disabled={item.status !== 'completed'}
+                              onClick={() => (props as any).onEditStoryboard(item.uuid)}
+                            >
+                              <Pencil className="size-3 mr-0.5" />
+                              Edit
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 px-2 text-xs text-[#53A2FF] hover:bg-[#e6f5ff]"
+                            disabled={item.status !== 'completed'}
+                            onClick={() => handleDownload(item)}
+                          >
+                            <Download className="size-3 mr-0.5" />
+                            Download
+                          </Button>
+                          
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       </div>
+
+      {/* Preview Modal - Outside opacity container */}
+      {viewingItem && (
+        <div
+          className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-2"
+          onClick={closePreview}
+        >
+          <div
+            className="bg-white w-full max-w-7xl h-[90vh] flex flex-col rounded-lg shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="p-6 border-b border-[#b3e0ff] flex items-center justify-between flex-shrink-0 bg-gradient-to-r from-blue-50/30 to-transparent">
+              <div className="flex-1">
+                <b className="text-slate-800 text-2xl font-bold block mb-1">
+                  {formatFileName(viewingItem.outputFilename)}
+                </b>
+                <div className="flex items-center gap-3 text-xs text-slate-500">
+                  <span className="flex items-center gap-1.5">
+                    {getFormatIcon(viewingItem.format)}
+                    {formatTypeName(viewingItem.format)}
+                  </span>
+                  <span>•</span>
+                  <span>{viewingItem.createdPerson}</span>
+                  <span>•</span>
+                  <span>{viewingItem.timestamp.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}</span>
+                </div>
+              </div>
+              <button
+                onClick={closePreview}
+                className="ml-6 h-10 w-10 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600 hover:text-slate-800 transition-all flex-shrink-0 shadow-sm hover:shadow-md"
+                title="Close preview"
+              >
+                <X className="size-5" />
+              </button>
+            </div>
+
+            {/* Content and Refine Panel */}
+            <div className="flex-1 overflow-hidden flex gap-0">
+              {/* Content Area */}
+              <div className="flex-1 overflow-hidden p-6 border-r border-[#b3e0ff] flex flex-col">
+                {/* Version tabs for non-microdrama items with multiple versions */}
+                {contentVersions.length > 1 && (
+                  <div className="flex items-center gap-1 mb-2 border-b border-gray-100 shrink-0">
+                    {contentVersions.map((v, i) => (
+                      <button
+                        key={i}
+                        onClick={() => handleContentVersionSelect(i)}
+                        className={`px-3 py-1.5 text-xs font-medium rounded-t-md border-b-2 transition-colors flex items-center gap-1 ${
+                          activeContentVersionIdx === i
+                            ? 'border-[#53A2FF] text-[#53A2FF] bg-blue-50'
+                            : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+                        }`}
+                      >
+                        {v.label}
+                        {activeContentVersionIdx === i && v.content === null && (
+                          <Loader2 className="size-3 animate-spin" />
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div className={`${contentVersions.length > 1 ? 'flex-1' : 'h-full'} bg-white rounded-lg border border-[#b3e0ff] overflow-y-auto`}>
+                  {viewingLoading ? (
+                    <div className="w-full h-full flex flex-col items-center justify-center">
+                      <Loader2 className="size-8 text-[#53A2FF] mb-2 animate-spin" />
+                      <p className="text-xs text-slate-600">Loading preview...</p>
+                    </div>
+                  ) : (
+                    renderPreview()
+                  )}
+                </div>
+              </div>
+
+              {/* Right Panel — Feedback (Sales CF formats) or AI Refinement (others) */}
+              {domain === 'sales' && viewingItem && isFeedbackFormat(viewingItem.format) ? (
+                <div
+                  className="flex flex-col h-full border-l border-[#b3e0ff] bg-white overflow-y-auto"
+                  style={{ width: '350px', minWidth: '350px' }}
+                >
+                  <ContentFeedback
+                    transactionUuid={viewingItem.uuid}
+                    formatType={viewingItem.format}
+                    domain={domain}
+                    onFeedbackSubmitted={(rating, text) =>
+                      setItemFeedback(prev => ({ ...prev, [viewingItem.uuid]: { rating, text } }))
+                    }
+                  />
+                </div>
+              ) : viewingItem && viewingItem.format.toLowerCase().replace(/[\s_-]/g, '') === 'microdrama' ? (
+                <MicroDramaRefineWithAI
+                  filePath={viewingItem.outputFilePath}
+                  onEditedUrl={(blobUrl, editedFilePath) => {
+                    setEditedVideoUrl(blobUrl);
+                    setVideoVersions(prev => {
+                      const newVersion: VideoVersion = {
+                        label: `Edit ${prev.length}`,
+                        filePath: editedFilePath,
+                        blobUrl,
+                      };
+                      const updated = [...prev, newVersion];
+                      setActiveVersionIdx(updated.length - 1);
+                      return updated;
+                    });
+                  }}
+                  className="w-[350px] shrink-0 border-l border-[#b3e0ff]"
+                />
+                ) : viewingItem && viewingItem.format.toLowerCase().replace(/[\s_-]/g, '') === 'banner' && domain === 'sales' ? (
+                <SalesBannerRefinePanel
+                  transactionUuid={viewingItem.uuid}
+                  versions={videoVersions.map((v, i) => ({
+                    version: i + 1,
+                    label: v.label,
+                    url: v.blobUrl || '',
+                    blob: new Blob(),
+                  }))}
+                  activeVersionIdx={activeVersionIdx}
+                  onNewVersion={(newVersion: SalesBannerVersion) => {
+                    setVideoVersions(prev => {
+                      const updated = [...prev, {
+                        label: newVersion.label,
+                        filePath: '',
+                        blobUrl: newVersion.url,
+                      }];
+                      setActiveVersionIdx(updated.length - 1);
+                      return updated;
+                    });
+                  }}
+                  onSelectVersion={(idx) => handleVersionSelect(idx)}
+                  className="w-[350px] shrink-0 border-l border-[#b3e0ff]"
+                />
+              ) : viewingItem && viewingItem.format.toLowerCase().replace(/[\s_-]/g, '') === 'banner' ? (
+                <BannerRefinePanel
+                  transactionUuid={viewingItem.uuid}
+                  bannerOptions={null}
+                  versions={videoVersions.map((v, i) => ({
+                    version: i + 1,
+                    label: v.label,
+                    url: v.blobUrl || '',
+                    blob: new Blob(),
+                  }))}
+                  activeVersionIdx={activeVersionIdx}
+                  onNewVersion={(newVersion: BannerVersion) => {
+                    setVideoVersions(prev => {
+                      const updated = [...prev, {
+                        label: newVersion.label,
+                        filePath: '',
+                        blobUrl: newVersion.url,
+                      }];
+                      setActiveVersionIdx(updated.length - 1);
+                      return updated;
+                    });
+                  }}
+                  onSelectVersion={(idx) => handleVersionSelect(idx)}
+                  domain={domain}
+                  className="w-[350px] shrink-0 border-l border-[#b3e0ff]"
+                />
+              ) : (
+                <RefineWithAI
+                  categories={historyPromptCategories}
+                  className="w-[350px] shrink-0 border-l border-[#b3e0ff]"
+                />
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="p-6 border-t border-[#b3e0ff] flex items-center justify-between flex-shrink-0">
+              <Button
+                onClick={() => handleDownload(viewingItem)}
+                disabled={viewingLoading}
+                className="bg-blue-600 hover:bg-blue-700 text-white"
+              >
+                {viewingLoading ? <Loader2 className="size-4 animate-spin mr-2" /> : <Download className="size-4 mr-2" />}
+                Download
+              </Button>
+
+              {domain !== 'sales' && (
+                <Button
+                  onClick={handlePushToVeeva}
+                  disabled={isPushing || !viewingItem}
+                  className="bg-green-600 hover:bg-green-700 text-white"
+                >
+                  {isPushing ? <Loader2 className="size-4 animate-spin mr-2" /> : <Upload className="size-4 mr-2" />}
+                  {pushSuccess ? 'Pushed!' : 'Push to Veeva'}
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Quiz Modal - Outside opacity container */}
+      <QuizModal
+        isOpen={showQuizModal}
+        quizData={quizData}
+        onClose={() => {
+          setShowQuizModal(false);
+          setQuizData(null);
+        }}
+      />
     </div>
   );
-}
-
+});
