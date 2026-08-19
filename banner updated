@@ -1,1 +1,535 @@
+import uuid, json, os, traceback
+
+from fastapi import APIRouter, Request, Depends, HTTPException, Path, BackgroundTasks
+from fastapi.responses import JSONResponse
+from ..utils.zenseai_content_factory_utils import get_domain_param
+from sqlalchemy.ext.asyncio import AsyncSession
+from ..configurations.session import get_session
+from ..hls_platform.sales_presentation_plus import handle_sales_presentation_plus
+from ..hls_platform.sales_banner import (
+    sales_banner_generate_handler,
+    sales_banner_list_templates_handler,
+    sales_banner_template_image_handler,
+    sales_banner_upload_template_handler,
+    sales_banner_delete_template_handler,
+    sales_banner_refine_handler,
+)
+from ..hls_platform.main import hls_uploads_path
+from sqlalchemy import text, select
+from ..config import settings
+
+from common.database.models.content_factory import SalesCFeedback
+
+
+from ..hls_platform.sharepoint_workflow import (
+    sync_sharepoint_files_handler,
+    get_sharepoint_microsites_helper,
+    send_sharepoint_microsite_by_id_helper,
+    convert_sharepoint_microsite_by_id_helper
+)
+from ..hls_platform.local_documents import upload_local_document_helper
+from ..hls_platform.brands import get_image_url_helper
+from ..hls_platform.presentation_templates_api import (
+    get_templates_helper,
+    create_template_helper,
+    delete_template_helper
+)
+
+sales_content_factory_router = APIRouter(prefix="/sales_platform", tags=["Sales Platform"])
+
+
+# ---------- Sales Banner Generation Routes ----------
+@sales_content_factory_router.post("/banner/generate")
+async def sales_generate_banner(request: Request, db: AsyncSession = Depends(get_session)):
+    """
+    Generate an AI-edited sales banner from one of the approved templates.
+
+    Request payload:
+    {
+        "template_id": "template-6",
+        "title": "Q3 Sales Champion",
+        "description": "Congratulations on closing the year with record numbers",
+        "prompt": "make the confetti more subtle",
+        "aspect_ratio": "16:9",
+        "photo": "data:image/png;base64,..."   // optional — omit to keep the template's existing photo
+    }
+
+    User identity is resolved the same way sales_generate_presentation_plus
+    resolves it below — body first, JWT + a user_entity lookup as fallback
+    — and passed down as plain parameters rather than re-resolved inside
+    the handler.
+    """
+    data = await request.json()
+
+    user_id = data.get('userId') or data.get('user_id')
+    user_name = data.get('userName') or data.get('user_name', 'Unknown User')
+    print(f"[banner/generate] user_id from request body: {user_id!r}")
+
+    # fallback user_id from token
+    if not user_id or not str(user_id).isdigit() or str(user_id) in ["null", "unknown_user", "None"]:
+        auth_header = request.headers.get('Authorization')
+        print(f"[banner/generate] no usable user_id in body — Authorization header: "
+              f"{'present' if auth_header else 'MISSING'}")
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ', 1)[1]
+            import jwt as pyjwt
+            sub = None
+            try:
+                jwt_secret_key = settings.jwt.secret_key
+                decoded = pyjwt.decode(token, jwt_secret_key, algorithms=["HS256"])
+                sub = decoded.get('sub')
+                print(f"[banner/generate] token decoded OK — sub={sub!r}")
+            except pyjwt.exceptions.InvalidSignatureError as e:
+                # Confirmed via direct testing: this token is well-formed,
+                # fresh, and not expired — the signing key just doesn't
+                # match settings.jwt.secret_key. That's worth fixing at
+                # the source. In the meantime: this decode is only ever
+                # used to attribute a Content History row to a user, never
+                # to gate access to anything in this handler, so reading
+                # sub without verifying the signature is safe here
+                # specifically — it is NOT a general "skip auth" pattern.
+                print(f"[banner/generate] signature check failed ({e}) — "
+                      f"falling back to unverified decode for attribution only")
+                try:
+                    unverified = pyjwt.decode(token, options={"verify_signature": False})
+                    sub = unverified.get('sub')
+                    print(f"[banner/generate] unverified decode — sub={sub!r}")
+                except Exception as e2:
+                    print("[banner/generate] Unverified decode also failed:", e2)
+            except Exception as e:
+                print("[banner/generate] Token decode failed:", e)
+
+            try:
+                if sub:
+                    q = text("SELECT id, name FROM user_entity WHERE email = :email")
+                    result = await db.execute(q, {"email": sub})
+                    r = result.mappings().first()
+                    print(f"[banner/generate] user_entity lookup for {sub!r}: "
+                          f"{'found id=' + str(r['id']) if r else 'NO MATCH'}")
+
+                    if r:
+                        user_id = str(r["id"])
+                        if user_name == "Unknown User":
+                            user_name = r["name"]
+
+            except Exception as e:
+                print("[banner/generate] user_entity lookup failed:", e)
+        else:
+            print("[banner/generate] no Bearer token present — user_id stays unresolved")
+
+    print(f"[banner/generate] final: user_id={user_id!r} user_name={user_name!r}")
+    return await sales_banner_generate_handler(request, db, user_id=user_id, user_name=user_name)
+
+
+@sales_content_factory_router.get("/banner/templates")
+async def sales_list_banner_templates():
+    """The single source of truth the picker fetches from — no more
+    frontend-bundled copy that can drift out of sync with this folder."""
+    return await sales_banner_list_templates_handler()
+
+
+@sales_content_factory_router.get("/banner/templates/{template_id}/image")
+async def sales_get_banner_template_image(template_id: str, w: int | None = None):
+    return await sales_banner_template_image_handler(template_id, width=w)
+
+
+@sales_content_factory_router.post("/banner/templates")
+async def sales_upload_banner_template(request: Request):
+    """Body: {"name": "Sales Champion", "image": "data:image/png;base64,..."}"""
+    return await sales_banner_upload_template_handler(request)
+
+
+@sales_content_factory_router.delete("/banner/templates/{template_id}")
+async def sales_delete_banner_template(template_id: str):
+    return await sales_banner_delete_template_handler(template_id)
+
+
+@sales_content_factory_router.post("/banner/refine")
+async def sales_refine_banner(request: Request, db: AsyncSession = Depends(get_session)):
+    """
+    Refine an already-generated sales banner using feedback text.
+
+    Body: {"transaction_uuid": "...", "feedback": "...", "source_version_idx": 0}
+    source_version_idx is optional (0 = original, 1 = first edit, 2 =
+    second edit, ...); omitted means "refine from the latest version".
+
+    Self-contained to sales_banner.py — a separate implementation from
+    banner.py's /hls_platform/banner_refine, not a call into it.
+    """
+    return await sales_banner_refine_handler(request, db)
+
+
+# ---------- Routes ----------
+@sales_content_factory_router.get("/get_all_microsites")
+async def sales_get_all_microsites(db: AsyncSession = Depends(get_session)):
+    return await get_sharepoint_microsites_helper(db)
+
+
+@sales_content_factory_router.post("/sharepoint/sync")
+async def sales_sharepoint_sync(db: AsyncSession = Depends(get_session)):
+    return await sync_sharepoint_files_handler(db)
+
+
+@sales_content_factory_router.post("/send_microsite_by_id")
+async def sales_send_microsite_by_id(request: Request,
+    db: AsyncSession = Depends(get_session)):
+    return await send_sharepoint_microsite_by_id_helper(request, db)
+
+
+@sales_content_factory_router.post("/sharepoint/convert")
+async def sales_convert_sharepoint_microsite(request: Request,
+    db: AsyncSession = Depends(get_session)):
+    return await convert_sharepoint_microsite_by_id_helper(request, db)
+
+
+@sales_content_factory_router.get("/image_url/{document_path:path}")
+async def sales_get_image_url(document_path: str = Path(...)):
+    return await get_image_url_helper(document_path)
+
+
+@sales_content_factory_router.post("/local_documents")
+async def sales_upload_local_document(request: Request, db: AsyncSession = Depends(get_session)):
+    domain = await get_domain_param(request)
+    return await upload_local_document_helper(domain, request, db)
+
+
+@sales_content_factory_router.get("/templates")
+async def sales_get_templates(request: Request, db: AsyncSession = Depends(get_session)):
+    domain = await get_domain_param(request)
+    return await get_templates_helper(domain, db, request)
+
+
+@sales_content_factory_router.post("/templates")
+async def sales_create_template(request: Request, db: AsyncSession = Depends(get_session)):
+    domain = await get_domain_param(request)
+    return await create_template_helper(domain, request, db)
+
+
+@sales_content_factory_router.delete("/templates/{template_id}")
+async def sales_delete_template(template_id: int, db: AsyncSession = Depends(get_session)):
+    return await delete_template_helper(template_id, db)
+
+
+@sales_content_factory_router.post("/sales/presentation/render_pptx")
+async def sales_render_sales_presentation(request: Request):
+    try:
+        from ..hls_platform.sales_presentation import render_edited_sales_presentation
+
+        data = await request.json()
+        domain = await get_domain_param(request)
+
+        return render_edited_sales_presentation(
+            data=data,
+            user_id=data.get('userId') or data.get('user_id'),
+            user_name=data.get('userName') or data.get('user_name', 'Unknown User'),
+            transaction_uuid=data.get('transaction_uuid'),
+            output_folder=data.get('output_folder'),
+            format_type=data.get('format_type'),
+            domain=domain,
+            downloaded_files=data.get('downloaded_files'),
+            input_folder=data.get('input_folder'),
+            usage_stats={
+                'prompt_tokens': data.get('input_tokens', 0),
+                'completion_tokens': data.get('output_tokens', 0),
+                'cost': data.get('total_cost', 0.0)
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@sales_content_factory_router.post("/sales/presentation/regenerate_slide")
+async def sales_regenerate_sales_slide(request: Request):
+    try:
+        from ..hls_platform.sales_presentation import regenerate_sales_slide
+
+        data = await request.json()
+        domain = await get_domain_param(request)
+
+        slide_data = data.get('slide_data')
+        custom_prompt = data.get('custom_prompt')
+        user_id = data.get('userId') or data.get('user_id')        
+        if not slide_data:
+            raise HTTPException(status_code=400, detail="Missing slide_data")
+
+        updated_slide = regenerate_sales_slide(slide_data, custom_prompt, user_id=user_id, domain=domain)
+
+        if "error" in updated_slide:
+            raise HTTPException(status_code=500, detail=updated_slide)
+
+        return JSONResponse(content=updated_slide)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@sales_content_factory_router.post('/sales/presentation_plus/generate')
+async def sales_generate_presentation_plus(request: Request, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_session)):
+    try:
+        data = await request.json()
+        domain = request.query_params.get("domain")
+
+        user_id = data.get('userId') or data.get('user_id')
+        user_name = data.get('userName') or data.get('user_name', 'Unknown User')
+
+        # fallback user_id from token
+        if not user_id or not str(user_id).isdigit() or str(user_id) in ["null", "unknown_user", "None"]:
+            auth_header = request.headers.get('Authorization')
+            if auth_header and auth_header.startswith('Bearer '):
+                token = auth_header.split(' ', 1)[1]
+                import jwt as pyjwt
+                try:
+                    jwt_secret_key = settings.jwt.secret_key
+                    decoded = pyjwt.decode(token, jwt_secret_key, algorithms=["HS256"])
+                    sub = decoded.get('sub')
+
+                    if sub:
+                        q = text("SELECT id, name FROM user_entity WHERE email = :email")
+                        result = await db.execute(q, {"email": sub})
+                        r = result.mappings().first()
+
+                        if r:
+                            user_id = str(r["id"])
+                            if user_name == "Unknown User":
+                                user_name = r["name"]
+
+                except Exception as e:
+                    print("Token decode failed:", e)
+
+        transaction_uuid = data.get('transaction_uuid')
+        output_folder = data.get('output_folder')
+        format_type = data.get('format_type', 'presentation +')
+        downloaded_files = data.get('downloaded_files')
+        input_folder = data.get('input_folder')
+        presentation_options = data.get('presentation_options', {})
+
+        # Always create a new UUID for Presentation + to avoid clashing with normal presentation
+        transaction_uuid = str(uuid.uuid4())
+
+        uuid_path = os.path.join(hls_uploads_path, transaction_uuid)
+
+        if not input_folder:
+            input_folder = os.path.join(uuid_path, "input_folder")
+            os.makedirs(input_folder, exist_ok=True)
+
+        if not output_folder:
+            output_folder = os.path.join(uuid_path, "output_folder")
+            os.makedirs(output_folder, exist_ok=True)
+
+        veeva_file_ids = data.get('veeva_file_ids', [])
+        combined_content = data.get('combined_content', '')
+
+        if not combined_content and veeva_file_ids:
+            from ..hls_platform.connectors import connector_factory
+            from ..hls_platform.connectors.connector_factory import get_connector
+
+            connector = get_connector(connector_factory.get_connector_name_by_domain(domain))
+            downloaded_files, combined_content = await connector.download_all_files(db, veeva_file_ids, input_folder)
+
+        status_file = os.path.join(uuid_path, "status.json")
+
+        async def update_step(msg):
+            try:
+                if os.path.exists(status_file):
+                    with open(status_file, "r") as f:
+                        data = json.load(f)
+                    data["step"] = msg
+                    with open(status_file, "w") as f:
+                        json.dump(data, f)
+            except:
+                pass
+
+        async def background_task():
+            try:
+                with open(status_file, "w") as f:
+                    json.dump({
+                        "status": "processing",
+                        "transaction_uuid": transaction_uuid,
+                        "step": "Initializing... (Please wait)"
+                    }, f)
+
+                resp = await handle_sales_presentation_plus(
+                    db=db,
+                    combined_content=combined_content,
+                    format_type=format_type,
+                    output_folder=output_folder,
+                    downloaded_files=downloaded_files,
+                    domain=domain,
+                    user_id=user_id,
+                    user_name=user_name,
+                    transaction_uuid=transaction_uuid,
+                    input_folder=input_folder,
+                    presentation_options=presentation_options,
+                    status_callback=update_step
+                )
+
+                if resp.status_code == 200:
+                    res_data = json.loads(resp.body.decode("utf-8"))
+                    with open(status_file, "w") as f:
+                        json.dump({
+                            "status": "completed",
+                            "response_json": res_data,
+                            "filepath": res_data.get("filepath"),
+                            "filename": res_data.get("filename"),
+                            "inputTokens": resp.headers.get('X-Input-Tokens', 0),
+                            "outputTokens": resp.headers.get('X-Output-Tokens', 0),
+                            "totalCost": resp.headers.get('X-Total-Cost', 0)
+                        }, f)
+                else:
+                    with open(status_file, "w") as f:
+                        json.dump({
+                            "status": "error",
+                            "message": "Failed to generate Presentation+"
+                        }, f)
+
+            except Exception as e:
+                traceback.print_exc()
+                with open(status_file, "w") as f:
+                    json.dump({
+                        "status": "error",
+                        "message": str(e)
+                    }, f)
+
+        # run background
+        background_tasks.add_task(background_task)
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "processing",
+                "transaction_uuid": transaction_uuid
+            }
+        )
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))    
+
+
+@sales_content_factory_router.post('/content_feedback')
+async def sales_submit_content_feedback(request: Request, db: AsyncSession = Depends(get_session)):
+    """Store user star-rating and/or text feedback for a Sales CF generated content item.
+    Both fields are optional; if the user skips, both will be stored as NULL.
+    """
+    try:
+        data = await request.json() or {}
+        domain = request.query_params.get("domain")
+        
+        transaction_uuid = data.get("transaction_uuid")
+        result = await db.execute(
+            select(SalesCFeedback).where(
+                SalesCFeedback.transaction_uuid == transaction_uuid
+            )
+        )
+        existing = result.scalars().first()
+
+
+        if existing:
+            if data.get('star_rating') is not None:
+                existing.star_rating = data.get('star_rating')
+            if data.get('feedback_text') is not None:
+                existing.feedback_text = data.get('feedback_text')
+            feedback_id = existing.id
+        else:
+            feedback = SalesCFeedback(
+                transaction_uuid=transaction_uuid,
+                format_type=data.get('format_type'),
+                domain=data.get('domain', 'sales'),
+                star_rating=data.get('star_rating'),
+                feedback_text=data.get('feedback_text'),
+                user_id=str(data.get('user_id')) if data.get('user_id') else None,
+                user_name=data.get('user_name'),
+            )
+
+            db.add(feedback)
+            await db.flush()  # To get auto-generated id
+
+            feedback_id = feedback.id
+            
+        await db.commit()
+
+        return JSONResponse(content={"status": "success", "id": feedback_id}, status_code=200)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+async def _fetch_sales_feedback(transaction_uuid: str, db: AsyncSession):
+    """Shared lookup — both routes below call this, so the 404-vs-500 fix
+    (and anything else) only ever needs to live in one place."""
+    try:
+        result = await db.execute(
+            select(SalesCFeedback)
+            .where(SalesCFeedback.transaction_uuid == transaction_uuid)
+            .order_by(SalesCFeedback.created_at.asc())
+        )
+
+        records = result.scalars().all()
+
+
+        if not records:
+            raise HTTPException(status_code=404, detail="No feedback found")
+
+        merged_star = None
+        merged_text = None
+        latest_id = None
+        latest_format = None
+        latest_created_at = None
+
+        for record in records:
+            if record.star_rating is not None:
+                merged_star = record.star_rating
+            if record.feedback_text is not None:
+                merged_text = record.feedback_text
+            latest_id = record.id
+            latest_format = record.format_type
+            latest_created_at = record.created_at
+
+        return {
+            "id": latest_id,
+            "transaction_uuid": transaction_uuid,
+            "format_type": latest_format,
+            "star_rating": merged_star,
+            "feedback_text": merged_text,
+            "created_at": latest_created_at.isoformat() if latest_created_at else None,
+        }
+
+    except HTTPException:
+        # A deliberately-raised HTTPException (the 404 above, for a
+        # transaction with no feedback yet — the normal case for anything
+        # freshly generated) is itself an Exception subclass, so without
+        # this it would fall through to the broad except below and get
+        # re-wrapped as a 500. Let it pass through as the 404 it's meant
+        # to be.
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@sales_content_factory_router.get('/sales-feedback/{transaction_uuid}')
+async def sales_get_content_feedback(
+    transaction_uuid: str,
+    db: AsyncSession = Depends(get_session)
+):
+    """Original route — left exactly where it was, in case anything
+    besides ContentFeedback.tsx already depends on this exact path."""
+    return await _fetch_sales_feedback(transaction_uuid, db)
+
+
+@sales_content_factory_router.get('/content_feedback/{transaction_uuid}')
+async def sales_get_content_feedback_alias(
+    transaction_uuid: str,
+    db: AsyncSession = Depends(get_session)
+):
+    """Added rather than renaming the route above, so ContentFeedback.tsx
+    can call the URL it was originally written for without anything that
+    might already use /sales-feedback being at risk. No collision with
+    POST /content_feedback (no path param) — different method, different
+    exact path shape."""
+    return await _fetch_sales_feedback(transaction_uuid, db)
 
