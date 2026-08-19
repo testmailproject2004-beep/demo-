@@ -5,3 +5,5 @@ Scope — sales only, confirmed two ways:
 Every URL in this file is hardcoded to sales_platform (not domain-parameterized), so it never touches HLS or any other domain's backend.
 The only current call site, ContentHistory.tsx, renders this component only when domain === 'sales'.
 No other lines in the file changed — the three POST .../content_feedback calls (submit, star rating, inline comment) were already correct.
+- `${middleware_url}/batch_process/sales_platform/content_feedback/${transactionUuid}`
++ `${middleware_url}/batch_process/sales_platform/sales-feedback/${transactionUuid}`
