@@ -1,9 +1,86 @@
-File: ContentFeedback.tsx → fetchExisting() (~line 62)
-Diff
-Why: content_feedback (no path param) is the POST route for submitting feedback. The GET-by-uuid route for fetching existing feedback is actually sales-feedback/{uuid} — this line was calling the wrong one, causing a 404 every time the feedback panel tried to load a previous rating.
-Scope — sales only, confirmed two ways:
-Every URL in this file is hardcoded to sales_platform (not domain-parameterized), so it never touches HLS or any other domain's backend.
-The only current call site, ContentHistory.tsx, renders this component only when domain === 'sales'.
-No other lines in the file changed — the three POST .../content_feedback calls (submit, star rating, inline comment) were already correct.
-- `${middleware_url}/batch_process/sales_platform/content_feedback/${transactionUuid}`
-+ `${middleware_url}/batch_process/sales_platform/sales-feedback/${transactionUuid}`
+Request URL
+http://localhost:8080/batch_process/sales_platform/sales-feedback/a822f41c-73a6-48c7-8f75-e743fb08824e
+Request Method
+OPTIONS
+Status Code
+200 OK
+Remote Address
+127.0.0.1:8080
+Referrer Policy
+strict-origin-when-cross-origin
+access-control-allow-credentials
+true
+access-control-allow-headers
+authorization
+access-control-allow-methods
+GET
+access-control-allow-origin
+http://localhost:3000
+content-length
+0
+date
+Wed, 19 Aug 2026 08:58:50 GMT
+server
+uvicorn
+vary
+Origin
+
+Request URL
+http://localhost:8080/batch_process/sales_platform/sales-feedback/a822f41c-73a6-48c7-8f75-e743fb08824e
+Request Method
+GET
+Status Code
+500 Internal Server Error
+Remote Address
+127.0.0.1:8080
+Referrer Policy
+strict-origin-when-cross-origin
+access-control-allow-credentials
+true
+access-control-allow-origin
+http://localhost:3000
+content-length
+35
+content-type
+application/json
+date
+Wed, 19 Aug 2026 08:58:50 GMT
+date
+Wed, 19 Aug 2026 08:58:51 GMT
+server
+uvicorn
+server
+uvicorn
+vary
+Origin
+accept
+*/*
+accept-encoding
+gzip, deflate, br, zstd
+accept-language
+en-US,en;q=0.9
+authorization
+Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkB6ZW5zYXIuY29tIiwiaWF0IjoxNzg3MDYwMjE3LCJleHAiOjE3ODcxNDY2MTd9.xuj_1sEONbUVudidZDddfDbrv8oYSyZKkpWK17INABM
+connection
+keep-alive
+host
+localhost:8080
+origin
+http://localhost:3000
+referer
+http://localhost:3000/
+sec-ch-ua
+"Not=A?Brand";v="99", "Microsoft Edge";v="151", "Chromium";v="151"
+sec-ch-ua-mobile
+?0
+sec-ch-ua-platform
+"Windows"
+sec-fetch-dest
+empty
+sec-fetch-mode
+cors
+sec-fetch-site
+same-site
+user-agent
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0
+
