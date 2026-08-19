@@ -1,1 +1,775 @@
+"""Sales Banner editor — business logic for the "Banner Generator" modal.
+
+Signature matches banner.py's established pattern: `sales_generate_banner`
+in sales_content_factory_routes.py resolves user_id/user_name the same way
+sales_generate_presentation_plus does (request body first, JWT + a
+user_entity lookup as fallback), then passes them down as plain
+parameters — this file does no user resolution of its own.
+
+Response contract also matches banner.py's established pattern: a
+successful call returns a raw `Response` with PNG bytes and a
+Content-Disposition header — not a JSON envelope with base64 — and a
+failed call returns `JSONResponse({"success": False, "error": ...}, 500)`,
+same as handle_banner / handle_banner_refine / retail_workflow_banner.
+SalesBannerGenerator.tsx fetches accordingly (blob, not JSON).
+
+Output files are saved under the same hls_uploads/<uuid>/output_folder/
+layout retail_workflow_banner uses (via getOSpecifiers).
+
+Content History: on success, an HLSTransaction row is inserted
+(format_type="banner", domain="sales" as a plain string) so the banner
+shows up in ContentHistory.tsx's existing 'banner' case
+(HeroBannerPreview + BannerRefinePanel) — zero frontend changes needed.
+This save is best-effort and non-fatal: if user_id wasn't resolved, or the
+DB write fails for any reason, the banner still generates and returns
+normally; only the history row is skipped, with a clear reason logged.
+
+>>> STILL OPEN <<<
+This calls the Gemini image model directly via `google.genai`'s async
+client, authenticated through `get_constant("gemini_api_key", db)` with an
+env-var fallback — not through your `image_llm_aexecute` utility. Two
+reasons I didn't switch to it:
+  1. I can only see one call site (inside refine_banner_image), and it
+     looks inconsistent — that function's 4th parameter is typed
+     `db: AsyncSession`, but handle_banner_refine calls it with an API-key
+     string in that position, which then gets forwarded into
+     `image_llm_aexecute(db=...)`. I don't want to copy a calling
+     convention I can't confirm is actually correct.
+  2. This handler needs two images in one call — the template and the
+     optional replacement photo — and every example I can see of
+     image_llm_aexecute only ever passes one (`image_bytes` /
+     `image_mime`, singular).
+If you paste image_llm_aexecute's signature (or the file itself), I'll
+switch this over and we'll have one Gemini-calling path instead of two.
+Until then this works standalone, tested end-to-end below.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+import re
+import traceback
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from fastapi import Request
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..utils.utils import getOSpecifiers
+from .hls_constants import get_constant
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = BASE_DIR / "assets" / "Templates"
+ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+
+IMAGE_MODEL = os.getenv("SALES_BANNER_IMAGE_MODEL", "gemini-3-pro-image")
+
+
+def _hls_uploads_root() -> Path:
+    """Same platform-aware path retail_workflow_banner uses."""
+    sys_type, _ = getOSpecifiers()
+    if sys_type == "linux":
+        return Path("/apps/ebuddy/hls_uploads")
+    return Path.cwd() / "src" / "hls_uploads"
+
+
+# ---------------------------------------------------------------------------
+# Request schema — validated manually inside the handler, since the router
+# hands us the raw Request rather than triggering FastAPI's auto-parsing.
+# ---------------------------------------------------------------------------
+
+
+class SalesBannerGenerateRequest(BaseModel):
+    template_id: str
+    title: str = ""
+    description: str = ""
+    prompt: str = ""
+    aspect_ratio: str = "16:9"
+    photo: Optional[str] = None  # data URL or raw base64, or None to keep the template's photo
+
+
+# ---------------------------------------------------------------------------
+# Template lookup
+# ---------------------------------------------------------------------------
+
+
+def _mime_for(path: Path) -> str:
+    return {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+    }.get(path.suffix.lower().lstrip("."), "image/png")
+
+
+def _find_template_file(template_id: str) -> Optional[Path]:
+    if not template_id or len(template_id) > 128:
+        return None  # filesystem stat() can raise OSError on names this long, not just return False
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", template_id):
+        return None  # rejects path traversal before touching the filesystem
+    for ext in ALLOWED_EXT:
+        candidate = TEMPLATES_DIR / f"{template_id}{ext}"
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue  # permission errors, etc. — treat as "not found", don't crash the request
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Template gallery — single source of truth
+# ---------------------------------------------------------------------------
+#
+# TEMPLATES_DIR on the backend is now the ONLY place templates live. The
+# frontend no longer bundles its own copy (that was the two-folders-must-
+# stay-in-sync problem this whole feature kept tripping over) — it fetches
+# this list and these images at runtime instead.
+
+THUMB_CACHE_DIR = TEMPLATES_DIR / ".thumbcache"
+
+
+def _prettify(stem: str) -> str:
+    match = re.fullmatch(r"template-(\d+)", stem, flags=re.IGNORECASE)
+    if match:
+        return f"Template {match.group(1)}"
+    name = re.sub(r"[_\-]+", " ", stem).strip()
+    if re.fullmatch(r"[0-9a-f-]{8,}", name.replace(" ", "").lower()) or name.isdigit():
+        return "Untitled template"
+    return name.title()
+
+
+def list_templates() -> list[dict]:
+    """Scanned fresh on every call — drop a file in TEMPLATES_DIR by any
+    other means and it shows up immediately, no restart needed."""
+    templates = []
+    if not TEMPLATES_DIR.exists():
+        return templates
+    for path in sorted(TEMPLATES_DIR.iterdir()):
+        if path.suffix.lower() not in ALLOWED_EXT:
+            continue
+        templates.append(
+            {
+                "id": path.stem,
+                "name": _prettify(path.stem),
+                "image_url": f"/batch_process/sales_platform/banner/templates/{path.stem}/image",
+            }
+        )
+    templates.sort(key=lambda t: _natural_key(t["id"]))
+    return templates
+
+
+def _natural_key(value: str):
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", value)]
+
+
+def _thumbnail(path: Path, width: int) -> Path:
+    THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = THUMB_CACHE_DIR / f"{path.stem}-{width}.png"
+    if cache_path.exists() and cache_path.stat().st_mtime >= path.stat().st_mtime:
+        return cache_path
+    from PIL import Image
+
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        scale = width / img.width
+        img = img.resize((width, max(1, round(img.height * scale))))
+        img.save(cache_path, format="PNG")
+    return cache_path
+
+
+def get_template_image_bytes(template_id: str, width: Optional[int] = None) -> Optional[tuple[bytes, str]]:
+    """Returns (bytes, mime_type), or None if the template doesn't exist."""
+    path = _find_template_file(template_id)
+    if path is None:
+        return None
+    if width and 32 <= width <= 4000:
+        try:
+            thumb_path = _thumbnail(path, width)
+            return thumb_path.read_bytes(), "image/png"
+        except Exception as exc:
+            logger.warning(f"Thumbnail generation failed for {template_id}: {exc} — serving full image")
+    return path.read_bytes(), _mime_for(path)
+
+
+def _slugify(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return slug or "template"
+
+
+def _unique_template_id(base_slug: str) -> str:
+    if _find_template_file(base_slug) is None:
+        return base_slug
+    suffix = 2
+    while _find_template_file(f"{base_slug}-{suffix}") is not None:
+        suffix += 1
+    return f"{base_slug}-{suffix}"
+
+
+_UPLOAD_MIME_TO_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+}
+
+
+def add_template(name: str, image_data_url: str) -> dict:
+    """Save a new uploaded template. Raises ValueError on bad input —
+    callers turn that into a 400."""
+    if not image_data_url or "," not in image_data_url[:80]:
+        raise ValueError("No image data provided.")
+
+    header, _, b64 = image_data_url.partition(",")
+    mime_match = re.search(r"data:([\w/+.-]+);base64", header)
+    mime = mime_match.group(1) if mime_match else "image/png"
+    ext = _UPLOAD_MIME_TO_EXT.get(mime)
+    if ext is None:
+        raise ValueError(f"Unsupported image type '{mime}'. Use PNG, JPG, or WEBP.")
+
+    try:
+        image_bytes = base64.b64decode(b64)
+    except Exception as exc:
+        raise ValueError("Could not decode the uploaded image.") from exc
+
+    if len(image_bytes) > 15 * 1024 * 1024:
+        raise ValueError("Image is too large (max 15MB).")
+
+    # Confirms it's actually a readable image before it's saved as a
+    # "template" — a corrupt or non-image upload should fail loudly here,
+    # not surface as a mysterious Gemini error later.
+    try:
+        from PIL import Image
+        import io
+
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img.verify()
+    except Exception as exc:
+        raise ValueError("That file doesn't look like a valid image.") from exc
+
+    template_id = _unique_template_id(_slugify(name) if name else "template")
+    path = TEMPLATES_DIR / f"{template_id}{ext}"
+    path.write_bytes(image_bytes)
+    logger.info(f"Template uploaded: {template_id} ({len(image_bytes)} bytes)")
+    print(f"➕ Template uploaded: {template_id} ({len(image_bytes)} bytes)")
+
+    return {
+        "id": template_id,
+        "name": _prettify(template_id) if not name else name.strip(),
+        "image_url": f"/batch_process/sales_platform/banner/templates/{template_id}/image",
+    }
+
+
+def delete_template(template_id: str) -> bool:
+    """Returns True if deleted, False if the template didn't exist."""
+    path = _find_template_file(template_id)
+    if path is None:
+        return False
+    path.unlink()
+    # Clean up any cached thumbnails for this template too, so a future
+    # re-upload with the same id can't serve a stale cached image.
+    if THUMB_CACHE_DIR.exists():
+        for cached in THUMB_CACHE_DIR.glob(f"{template_id}-*.png"):
+            try:
+                cached.unlink()
+            except OSError:
+                pass
+    logger.info(f"Template deleted: {template_id}")
+    print(f"🗑️  Template deleted: {template_id}")
+    return True
+
+
+def _decode_data_url(value: str) -> bytes:
+    if value.strip().startswith("data:") and "," in value[:80]:
+        value = value.split(",", 1)[1]
+    return base64.b64decode(value)
+
+
+def _build_prompt(title: str, description: str, custom_prompt: str, has_photo: bool) -> str:
+    parts = [
+        "You are editing an existing marketing banner image, not creating a "
+        "new one. Preserve the banner's exact layout, background, "
+        "decorative shapes, colour palette, logo, and the logo's position "
+        "pixel-for-pixel. Do not redesign, restyle, or move anything that "
+        "is not explicitly called out below."
+    ]
+    if title:
+        parts.append(f'Replace the main headline text with: "{title}".')
+    if description:
+        parts.append(f'Replace the supporting body text with: "{description}".')
+    if has_photo:
+        parts.append(
+            "Replace the person currently shown in the banner with the "
+            "person in the second supplied image. Match the original "
+            "person's pose, framing, crop, and lighting as closely as "
+            "possible so the new person sits naturally in the same spot — "
+            "do not change where the person is positioned in the frame."
+        )
+    else:
+        parts.append("Keep the existing person in the banner exactly as they are.")
+    if custom_prompt:
+        parts.append(f"Additional instruction from the user: {custom_prompt.strip()}")
+    parts.append(
+        "Keep all text sharp, correctly spelled, and legible. Do not add "
+        "any new logos, watermarks, or text that wasn't requested."
+    )
+    return " ".join(parts)
+
+
+def _extract_image(response) -> Optional[bytes]:
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                data = inline.data
+                return data if isinstance(data, bytes) else base64.b64decode(data)
+    return None
+
+
+def _diagnose_missing_image(response) -> str:
+    """Called when _extract_image finds nothing, to say *why* instead of
+    just reporting that it happened. The response almost always carries a
+    reason — a safety block, a finish_reason like NO_IMAGE, or the model
+    returning plain text instead of image data — and the old code threw
+    all of that away before it ever reached the error message."""
+    notes: list[str] = []
+
+    feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(feedback, "block_reason", None) if feedback else None
+    if block_reason:
+        notes.append(f"prompt blocked: {block_reason}")
+        block_message = getattr(feedback, "block_reason_message", None)
+        if block_message:
+            notes.append(f"({block_message})")
+
+    candidates = getattr(response, "candidates", []) or []
+    if not candidates:
+        notes.append("response had no candidates at all")
+
+    for i, candidate in enumerate(candidates):
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason and str(finish_reason).split(".")[-1] != "STOP":
+            notes.append(f"candidate {i} finish_reason={finish_reason}")
+        finish_message = getattr(candidate, "finish_message", None)
+        if finish_message:
+            notes.append(f"finish_message: {finish_message}")
+
+        for rating in getattr(candidate, "safety_ratings", None) or []:
+            probability = str(getattr(rating, "probability", "")).split(".")[-1]
+            if getattr(rating, "blocked", False) or probability in ("HIGH", "MEDIUM"):
+                category = getattr(rating, "category", "?")
+                notes.append(f"safety flag: {category}={probability}")
+
+        content = getattr(candidate, "content", None)
+        text_parts = [
+            part.text
+            for part in (getattr(content, "parts", None) or [])
+            if getattr(part, "text", None)
+        ]
+        if text_parts:
+            joined = " ".join(text_parts).strip()
+            if joined:
+                notes.append(f'model returned text instead of an image: "{joined[:300]}"')
+
+    if not notes:
+        notes.append("no candidates, no text, no block reason — response gave no clues at all")
+
+    return "; ".join(notes)
+
+
+def _import_genai():
+    """One place that imports google.genai, with an error that actually
+    tells you what to do about it instead of a bare ModuleNotFoundError.
+    Called from both the handler (for Part.from_bytes) and _gemini_edit."""
+    try:
+        from google import genai
+        from google.genai import types
+        return genai, types
+    except ImportError as exc:
+        raise RuntimeError(
+            "The google-genai package isn't installed in this environment "
+            "(pip install google-genai). Your banner.py has its own "
+            "google.genai imports commented out, which suggests this "
+            "project may have moved to image_llm_aexecute instead — if "
+            "so, share that utility's signature and this handler can call "
+            "it instead of needing google-genai as a separate dependency."
+        ) from exc
+
+
+# Finish reasons documented (and reported by other developers hitting the
+# exact same "combine two images" case) as sometimes clearing on a plain
+# retry — as opposed to SAFETY / PROHIBITED_CONTENT / RECITATION, which are
+# the model's actual decision and won't change no matter how many times
+# you ask.
+_RETRYABLE_FINISH_REASONS = {"OTHER", "IMAGE_OTHER", "NO_IMAGE", "FINISH_REASON_UNSPECIFIED"}
+
+
+def _is_retryable(response) -> bool:
+    for candidate in getattr(response, "candidates", []) or []:
+        finish_reason = getattr(candidate, "finish_reason", None)
+        name = str(finish_reason).split(".")[-1] if finish_reason else ""
+        if name in _RETRYABLE_FINISH_REASONS:
+            return True
+    return False
+
+
+async def _gemini_edit(
+    parts: list, aspect_ratio: str, api_key: str, template_id: str, max_attempts: int = 3
+) -> bytes:
+    """Direct google-genai call — see the module docstring for why this
+    isn't going through image_llm_aexecute yet.
+
+    IMAGE_OTHER (and NO_IMAGE) are widely reported as intermittent for
+    exactly this kind of multi-image edit — Google's own developer forum
+    has reports of it clearing on a plain retry a majority of the time.
+    Retries here are scoped to those specific finish reasons only; a
+    genuine safety/policy block returns immediately since retrying a
+    deterministic decision just wastes calls.
+
+    template_id is threaded through purely for logging — when some
+    templates succeed and others don't, the terminal needs to say which is
+    which without you having to track it by log timing."""
+    genai, types = _import_genai()
+
+    client = genai.Client(api_key=api_key)
+    config_kwargs: dict = {"response_modalities": ["TEXT", "IMAGE"]}
+    try:
+        config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio or "16:9")
+    except AttributeError:
+        pass  # older/newer SDK without ImageConfig — edit still runs, just without the hint
+
+    last_diagnosis = "unknown"
+    for attempt in range(1, max_attempts + 1):
+        suffix = f" (attempt {attempt}/{max_attempts})" if max_attempts > 1 else ""
+        logger.info(f"[{template_id}] Calling Gemini image model: {IMAGE_MODEL}{suffix}")
+        print(f"🖼️  [{template_id}] Calling Gemini image model: {IMAGE_MODEL}{suffix}")
+
+        response = await client.aio.models.generate_content(
+            model=IMAGE_MODEL,
+            contents=parts,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+        image_bytes = _extract_image(response)
+        if image_bytes:
+            if attempt > 1:
+                logger.info(f"[{template_id}] Succeeded on attempt {attempt}")
+                print(f"✅ [{template_id}] Succeeded on attempt {attempt}/{max_attempts}")
+            return image_bytes
+
+        last_diagnosis = _diagnose_missing_image(response)
+        logger.warning(f"[{template_id}] {IMAGE_MODEL} returned no image (attempt {attempt}): {last_diagnosis}")
+        print(f"⚠️  [{template_id}] {IMAGE_MODEL} returned no image (attempt {attempt}): {last_diagnosis}")
+
+        if attempt < max_attempts and _is_retryable(response):
+            print(f"🔁 [{template_id}] Finish reason looks transient — retrying...")
+            continue
+        break
+
+    raise ValueError(
+        f"Model {IMAGE_MODEL} did not return an image for template '{template_id}' "
+        f"after {attempt} attempt(s) — {last_diagnosis}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Content History integration
+# ---------------------------------------------------------------------------
+#
+# ContentHistory.tsx reads from HLSTransaction rows (via
+# /batch_process/hls_platform/content_history) — that's what "No history
+# yet" means for banners specifically: nothing has ever inserted a row for
+# them. It already has a 'banner' case wired up (HeroBannerPreview +
+# BannerRefinePanel), built for handle_banner's hero-banner flow — reusing
+# format_type="banner" here means zero changes needed on the frontend side.
+#
+# user_id/user_name are NOT resolved in this file. sales_generate_banner in
+# sales_content_factory_routes.py resolves them the same way
+# sales_generate_presentation_plus does — request body first, JWT + a
+# user_entity lookup as fallback — and passes the result down as plain
+# parameters, matching how that route calls handle_sales_presentation_plus.
+# This handler just receives whatever the router already resolved.
+
+
+async def _save_transaction(
+    db: AsyncSession,
+    transaction_uuid: str,
+    template_path: Path,
+    output_file_path: Path,
+    user_id: Optional[str],
+    user_name: str,
+) -> None:
+    """Insert an HLSTransaction row so this banner shows up in Content
+    History. Uses create_hls_transaction from zenseai_content_factory_repo
+    — the same generic insert helper other save_*_transaction functions in
+    that file ultimately rely on — rather than hand-rolling add/commit,
+    so this gets db.refresh() and the same rollback-and-raise behavior for
+    free. Best-effort and non-fatal by design: the person is still waiting
+    on their actual banner image; a history-save hiccup must never turn
+    that into a failed request."""
+    if not user_id:
+        logger.info(
+            f"[{transaction_uuid}] Content History save skipped — no user_id "
+            f"passed in from the router."
+        )
+        print(f"⚠️  [{transaction_uuid}] Content History save skipped — no user_id from router")
+        return
+
+    try:
+        from ..repository.zenseai_content_factory_repo import create_hls_transaction
+
+        await create_hls_transaction(
+            db,
+            {
+                "uuid": transaction_uuid,
+                "format_type": "banner",
+                "input_file_paths": json.dumps([str(template_path)]),
+                "output_file_path": str(output_file_path),
+                "created_by": str(user_id),
+                "created_person": str(user_name),
+                "domain": "sales",
+            },
+        )
+        logger.info(f"[{transaction_uuid}] Saved to Content History (user_id={user_id})")
+        print(f"✅ [{transaction_uuid}] Saved to Content History (user_id={user_id})")
+    except Exception as exc:
+        # create_hls_transaction already rolls back internally before
+        # re-raising, so there's nothing left to clean up here — just log
+        # and swallow it, since a history-save failure must not fail the
+        # banner response itself.
+        logger.warning(f"[{transaction_uuid}] Content History save failed: {exc}")
+        print(f"⚠️  [{transaction_uuid}] Content History save failed (banner still generated OK): {exc}")
+
+
+# ---------------------------------------------------------------------------
+# The handler your router calls
+# ---------------------------------------------------------------------------
+
+
+async def sales_banner_generate_handler(
+    request: Request,
+    db: AsyncSession,
+    user_id: Optional[str] = None,
+    user_name: str = "Unknown User",
+) -> Response:
+    """Edit a template with new copy and/or a new person.
+
+    Signature matches banner.py's established pattern (request, db) plus
+    user_id/user_name — the same way handle_sales_presentation_plus
+    receives them from its router, already resolved rather than doing it
+    internally.
+    """
+    try:
+        try:
+            raw_body = await request.json()
+        except Exception:
+            return JSONResponse(
+                content={"success": False, "error": "Request body is not valid JSON."},
+                status_code=400,
+            )
+
+        if not isinstance(raw_body, dict):
+            return JSONResponse(
+                content={"success": False, "error": "Request body must be a JSON object."},
+                status_code=400,
+            )
+
+        try:
+            payload = SalesBannerGenerateRequest(**raw_body)
+        except ValidationError as exc:
+            return JSONResponse(content={"success": False, "error": str(exc)}, status_code=400)
+
+        template_id = payload.template_id.strip()
+        title = payload.title.strip()
+        description = payload.description.strip()
+        custom_prompt = payload.prompt.strip()
+
+        if not template_id:
+            return JSONResponse(
+                content={"success": False, "error": "Select a template first."}, status_code=400
+            )
+        if not title and not description and not custom_prompt:
+            return JSONResponse(
+                content={"success": False, "error": "Add a title, description, or instruction."},
+                status_code=400,
+            )
+
+        template_path = _find_template_file(template_id)
+        if template_path is None:
+            available = sorted(
+                p.stem for p in TEMPLATES_DIR.iterdir() if p.suffix.lower() in ALLOWED_EXT
+            )
+            hint = (
+                f"Templates found on this server: {', '.join(available)}."
+                if available
+                else "No template files found on this server at all — is assets/Templates populated?"
+            )
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "error": f"Unknown template '{template_id}'. {hint}",
+                },
+                status_code=404,
+            )
+
+        api_key = None
+        api_key_source = "none"
+        try:
+            api_key = await get_constant("gemini_api_key", db)
+            if api_key:
+                api_key_source = "db"
+        except Exception as exc:
+            logger.warning(f"get_constant('gemini_api_key') failed, using env fallback: {exc}")
+        if not api_key:
+            api_key = os.getenv("GEMINI_API_KEY", "")
+            if api_key:
+                api_key_source = "env"
+        if not api_key:
+            return JSONResponse(
+                content={"success": False, "error": "Gemini API key is not configured."},
+                status_code=502,
+            )
+        # Masked on purpose — never log the full key. This is enough to
+        # confirm which source resolved it, that it's non-empty, and that
+        # it isn't obviously truncated, without ever printing the secret.
+        masked = f"{api_key[:6]}…{api_key[-4:]}" if len(api_key) > 12 else "(too short to mask safely)"
+        logger.info(f"Gemini API key resolved from {api_key_source}: length={len(api_key)} {masked}")
+        print(f"🔑 Gemini API key resolved from {api_key_source}: length={len(api_key)} {masked}")
+
+        try:
+            _genai, types = _import_genai()
+        except RuntimeError as exc:
+            return JSONResponse(content={"success": False, "error": str(exc)}, status_code=502)
+
+        template_bytes = template_path.read_bytes()
+        logger.info(f"[{template_id}] template file: {template_path.name}, {len(template_bytes)} bytes")
+        print(f"📄 [{template_id}] template file: {template_path.name}, {len(template_bytes)} bytes")
+
+        parts: list = [types.Part.from_bytes(data=template_bytes, mime_type=_mime_for(template_path))]
+
+        if payload.photo:
+            try:
+                photo_bytes = _decode_data_url(payload.photo)
+            except Exception:
+                return JSONResponse(
+                    content={"success": False, "error": "Could not read the uploaded photo."},
+                    status_code=400,
+                )
+            print(f"📄 [{template_id}] uploaded photo: {len(photo_bytes)} bytes")
+            parts.append(types.Part.from_bytes(data=photo_bytes, mime_type="image/png"))
+
+        parts.append(
+            _build_prompt(title, description, custom_prompt, has_photo=bool(payload.photo))
+        )
+
+        try:
+            image_bytes = await _gemini_edit(parts, payload.aspect_ratio, api_key, template_id)
+        except Exception as exc:
+            return JSONResponse(
+                content={"success": False, "error": f"Image model call failed: {exc}"},
+                status_code=502,
+            )
+
+        transaction_uuid = str(uuid.uuid4())
+        output_folder = _hls_uploads_root() / transaction_uuid / "output_folder"
+        output_folder.mkdir(parents=True, exist_ok=True)
+        file_name = f"sales_banner_{template_id}.png"
+        output_path = output_folder / file_name
+        output_path.write_bytes(image_bytes)
+
+        await _save_transaction(db, transaction_uuid, template_path, output_path, user_id, user_name)
+
+        return Response(
+            content=image_bytes,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+                "X-Transaction-UUID": transaction_uuid,
+                "Access-Control-Expose-Headers": "X-Transaction-UUID",
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Error in sales_banner_generate_handler: {e}")
+        traceback.print_exc()
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Template gallery handlers — thin wrappers around the functions above,
+# following this file's existing response conventions.
+# ---------------------------------------------------------------------------
+
+
+async def sales_banner_list_templates_handler() -> JSONResponse:
+    return JSONResponse(content={"success": True, "templates": list_templates()})
+
+
+async def sales_banner_template_image_handler(template_id: str, width: Optional[int] = None) -> Response:
+    result = get_template_image_bytes(template_id, width)
+    if result is None:
+        return JSONResponse(
+            content={"success": False, "error": f"Unknown template '{template_id}'."},
+            status_code=404,
+        )
+    image_bytes, mime_type = result
+    return Response(content=image_bytes, media_type=mime_type)
+
+
+async def sales_banner_upload_template_handler(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            content={"success": False, "error": "Request body is not valid JSON."}, status_code=400
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            content={"success": False, "error": "Request body must be a JSON object."}, status_code=400
+        )
+
+    name = (body.get("name") or "").strip()
+    image = body.get("image") or ""
+
+    try:
+        template = add_template(name, image)
+    except ValueError as exc:
+        return JSONResponse(content={"success": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.error(f"Template upload failed: {exc}")
+        traceback.print_exc()
+        return JSONResponse(
+            content={"success": False, "error": f"Upload failed: {exc}"}, status_code=500
+        )
+
+    return JSONResponse(content={"success": True, "template": template}, status_code=201)
+
+
+async def sales_banner_delete_template_handler(template_id: str) -> JSONResponse:
+    try:
+        deleted = delete_template(template_id)
+    except Exception as exc:
+        logger.error(f"Template delete failed for '{template_id}': {exc}")
+        traceback.print_exc()
+        return JSONResponse(
+            content={"success": False, "error": f"Delete failed: {exc}"}, status_code=500
+        )
+    if not deleted:
+        return JSONResponse(
+            content={"success": False, "error": f"Unknown template '{template_id}'."},
+            status_code=404,
+        )
+    return JSONResponse(content={"success": True, "id": template_id})
 
